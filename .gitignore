@@ -1,0 +1,78 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Logs / runtime outputs
+closed_loop_outputs/
+grasp_videos/
+*.log
+
+# Temporary / generated data
+bridge_data/*.npz
+bridge_data/*.ply
+bridge_data/*.png
+/tmp/
+*.ply
+*.mp4
+
+# Archived development history
+archive/
+
+# Local milestone snapshots
+milestones/
+
+# GraspNet generated / compiled artifacts
+models/graspnet/**/build/
+models/graspnet/**/dist/
+models/graspnet/**/*.egg-info/
+models/graspnet/**/*.egg
+models/graspnet/**/*.so
+models/graspnet/**/*.o
+models/graspnet/**/__pycache__/
+
+# GraspNet model checkpoint
+models/graspnet/logs/log_rs/checkpoint.tar
+
+# GroundingDINO generated / compiled artifacts
+third_party/GroundingDINO/build/
+third_party/GroundingDINO/groundingdino.egg-info/
+third_party/GroundingDINO/**/*.so
+third_party/GroundingDINO/**/*.o
+third_party/GroundingDINO/**/__pycache__/
+
+# Nested git repositories / histories
+assets/scanned_objects/.git/
+
+# Editor / IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Scanned-object dataset: keep only the 5 objects used by the formal MuJoCo scene
+assets/scanned_objects/models/*
+!assets/scanned_objects/models/ACE_Coffee_Mug_Kristen_16_oz_cup/
+!assets/scanned_objects/models/ACE_Coffee_Mug_Kristen_16_oz_cup/**
+!assets/scanned_objects/models/Ecoforms_Cup_B4_SAN/
+!assets/scanned_objects/models/Ecoforms_Cup_B4_SAN/**
+!assets/scanned_objects/models/Circo_Fish_Toothbrush_Holder_14995988/
+!assets/scanned_objects/models/Circo_Fish_Toothbrush_Holder_14995988/**
+!assets/scanned_objects/models/BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup/
+!assets/scanned_objects/models/BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup/**
+!assets/scanned_objects/models/Canon_Pixma_Ink_Cartridge_8/
+!assets/scanned_objects/models/Canon_Pixma_Ink_Cartridge_8/**
+
+# Keep only the matching robosuite adapters
+assets/scanned_objects/robosuite_adapters/*
+!assets/scanned_objects/robosuite_adapters/ACE_Coffee_Mug_Kristen_16_oz_cup/
+!assets/scanned_objects/robosuite_adapters/ACE_Coffee_Mug_Kristen_16_oz_cup/**
+!assets/scanned_objects/robosuite_adapters/Ecoforms_Cup_B4_SAN/
+!assets/scanned_objects/robosuite_adapters/Ecoforms_Cup_B4_SAN/**
+!assets/scanned_objects/robosuite_adapters/Circo_Fish_Toothbrush_Holder_14995988/
+!assets/scanned_objects/robosuite_adapters/Circo_Fish_Toothbrush_Holder_14995988/**
+!assets/scanned_objects/robosuite_adapters/BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup/
+!assets/scanned_objects/robosuite_adapters/BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup/**
+!assets/scanned_objects/robosuite_adapters/Canon_Pixma_Ink_Cartridge_8/
+!assets/scanned_objects/robosuite_adapters/Canon_Pixma_Ink_Cartridge_8/**

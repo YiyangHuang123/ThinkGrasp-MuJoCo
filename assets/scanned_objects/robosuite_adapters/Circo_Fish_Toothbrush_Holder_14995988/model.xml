@@ -1,0 +1,36 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="Circo_Fish_Toothbrush_Holder_14995988"><asset><texture type="2d" name="texture" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/texture.png" /><material name="material_0" texture="texture" specular="0.5" shininess="0.5" /><mesh name="model" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model.obj" /><mesh name="model_collision_0" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_0.obj" /><mesh name="model_collision_1" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_1.obj" /><mesh name="model_collision_2" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_2.obj" /><mesh name="model_collision_3" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_3.obj" /><mesh name="model_collision_4" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_4.obj" /><mesh name="model_collision_5" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_5.obj" /><mesh name="model_collision_6" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_6.obj" /><mesh name="model_collision_7" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_7.obj" /><mesh name="model_collision_8" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_8.obj" /><mesh name="model_collision_9" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_9.obj" /><mesh name="model_collision_10" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_10.obj" /><mesh name="model_collision_11" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_11.obj" /><mesh name="model_collision_12" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_12.obj" /><mesh name="model_collision_13" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_13.obj" /><mesh name="model_collision_14" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_14.obj" /><mesh name="model_collision_15" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_15.obj" /><mesh name="model_collision_16" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_16.obj" /><mesh name="model_collision_17" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_17.obj" /><mesh name="model_collision_18" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_18.obj" /><mesh name="model_collision_19" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_19.obj" /><mesh name="model_collision_20" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_20.obj" /><mesh name="model_collision_21" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_21.obj" /><mesh name="model_collision_22" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_22.obj" /><mesh name="model_collision_23" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_23.obj" /><mesh name="model_collision_24" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_24.obj" /><mesh name="model_collision_25" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_25.obj" /><mesh name="model_collision_26" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_26.obj" /><mesh name="model_collision_27" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_27.obj" /><mesh name="model_collision_28" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_28.obj" /><mesh name="model_collision_29" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_29.obj" /><mesh name="model_collision_30" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_30.obj" /><mesh name="model_collision_31" file="../../models/Circo_Fish_Toothbrush_Holder_14995988/model_collision_31.obj" /></asset><worldbody><body name="wrapper"><body name="object">
+      <geom material="material_0" mesh="model" type="mesh" contype="0" conaffinity="0" group="1" />
+      <geom mesh="model_collision_0" type="mesh" group="0" />
+      <geom mesh="model_collision_1" type="mesh" group="0" />
+      <geom mesh="model_collision_2" type="mesh" group="0" />
+      <geom mesh="model_collision_3" type="mesh" group="0" />
+      <geom mesh="model_collision_4" type="mesh" group="0" />
+      <geom mesh="model_collision_5" type="mesh" group="0" />
+      <geom mesh="model_collision_6" type="mesh" group="0" />
+      <geom mesh="model_collision_7" type="mesh" group="0" />
+      <geom mesh="model_collision_8" type="mesh" group="0" />
+      <geom mesh="model_collision_9" type="mesh" group="0" />
+      <geom mesh="model_collision_10" type="mesh" group="0" />
+      <geom mesh="model_collision_11" type="mesh" group="0" />
+      <geom mesh="model_collision_12" type="mesh" group="0" />
+      <geom mesh="model_collision_13" type="mesh" group="0" />
+      <geom mesh="model_collision_14" type="mesh" group="0" />
+      <geom mesh="model_collision_15" type="mesh" group="0" />
+      <geom mesh="model_collision_16" type="mesh" group="0" />
+      <geom mesh="model_collision_17" type="mesh" group="0" />
+      <geom mesh="model_collision_18" type="mesh" group="0" />
+      <geom mesh="model_collision_19" type="mesh" group="0" />
+      <geom mesh="model_collision_20" type="mesh" group="0" />
+      <geom mesh="model_collision_21" type="mesh" group="0" />
+      <geom mesh="model_collision_22" type="mesh" group="0" />
+      <geom mesh="model_collision_23" type="mesh" group="0" />
+      <geom mesh="model_collision_24" type="mesh" group="0" />
+      <geom mesh="model_collision_25" type="mesh" group="0" />
+      <geom mesh="model_collision_26" type="mesh" group="0" />
+      <geom mesh="model_collision_27" type="mesh" group="0" />
+      <geom mesh="model_collision_28" type="mesh" group="0" />
+      <geom mesh="model_collision_29" type="mesh" group="0" />
+      <geom mesh="model_collision_30" type="mesh" group="0" />
+      <geom mesh="model_collision_31" type="mesh" group="0" />
+    </body><site name="bottom_site" pos="0.0 0.0 -2.4e-05" size="0.001" rgba="0 0 0 0" /><site name="top_site" pos="0.0 0.0 0.101869" size="0.001" rgba="0 0 0 0" /><site name="horizontal_radius_site" pos="0.077558 0.0 0.0" size="0.001" rgba="0 0 0 0" /></body></worldbody></mujoco>
