@@ -76,3 +76,6 @@ assets/scanned_objects/robosuite_adapters/*
 !assets/scanned_objects/robosuite_adapters/BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup/**
 !assets/scanned_objects/robosuite_adapters/Canon_Pixma_Ink_Cartridge_8/
 !assets/scanned_objects/robosuite_adapters/Canon_Pixma_Ink_Cartridge_8/**
+
+# Project-local compiled native extensions
+.native_runtime/

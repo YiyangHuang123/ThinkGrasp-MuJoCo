@@ -71,6 +71,10 @@ OSC is not used as the formal grasp execution controller.
 │   └── scanned_objects/
 ├── models/
 │   └── graspnet/
+├── scripts/
+│   ├── build_native_extensions.sh
+│   ├── setup_runtime_env.sh
+│   └── validate_installation.py
 └── third_party/
     └── GroundingDINO/
 ```
@@ -129,31 +133,65 @@ The main MuJoCo environment and the legacy perception environment are intentiona
 
 ## Required Environment Variables
 
-Before running the closed loop, define the Python interpreters used by the subprocess workers.
+Before building native extensions or running the closed loop, define the Python interpreter used by the legacy perception workers:
 
 ```bash
-export LEGACY_PERCEPTION_PYTHON=/path/to/legacy_python3.8
-export GRASPNET_PYTHON=/path/to/graspnet_python
+export LEGACY_PERCEPTION_PYTHON=/path/to/legacy/python3.8
 ```
 
-The VLM client uses:
+GraspNet can use the same interpreter:
 
 ```bash
-export VLM_BASE_URL=http://127.0.0.1:8000/v1
-export VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct
+export GRASPNET_PYTHON="$LEGACY_PERCEPTION_PYTHON"
 ```
 
-If the endpoint requires an API key:
+If a separate GraspNet environment is used instead:
 
 ```bash
-export OPENAI_API_KEY=your_api_key
+export GRASPNET_PYTHON=/path/to/graspnet/python
 ```
 
-For a local OpenAI-compatible endpoint that does not require authentication, the code defaults to:
+For native extension compilation, also define a CUDA toolkit compatible with the PyTorch version installed in the legacy perception environment:
+
+```bash
+export CUDA_HOME=/path/to/compatible/cuda/toolkit
+```
+
+Do not assume that the system-wide CUDA toolkit is compatible with the legacy PyTorch build.
+
+## Native CUDA Extensions
+
+GroundingDINO, PointNet2, and KNN require compiled native extensions.
+
+Build all required extensions with:
+
+```bash
+bash scripts/build_native_extensions.sh
+```
+
+The script builds:
 
 ```text
-OPENAI_API_KEY=EMPTY
+GroundingDINO CUDA extension
+PointNet2 CUDA extension
+KNN CUDA extension
 ```
+
+The PointNet2 and KNN runtime packages are copied into:
+
+```text
+.native_runtime/
+```
+
+This directory is generated locally and excluded from Git.
+
+GroundingDINO is built in place under:
+
+```text
+third_party/GroundingDINO/
+```
+
+Normal project execution does not require temporary `/tmp` extension directories.
 
 ## VLM
 
@@ -165,10 +203,49 @@ Qwen/Qwen3-VL-4B-Instruct
 
 `vlm_bridge.py` communicates with an OpenAI-compatible API endpoint.
 
-The default endpoint is:
+The Qwen model is served separately from the MuJoCo process. A validated deployment uses vLLM.
+
+Prepare a vLLM environment and a local Qwen model directory:
+
+```bash
+export QWEN_ENV=/path/to/qwen_vllm_environment
+export QWEN_MODEL_PATH=/path/to/Qwen3-VL-4B-Instruct
+```
+
+Start the Qwen service in a dedicated terminal:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+"$QWEN_ENV/bin/vllm" serve \
+"$QWEN_MODEL_PATH" \
+  --served-model-name Qwen/Qwen3-VL-4B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --gpu-memory-utilization 0.75 \
+  --max-model-len 4096 \
+  --dtype bfloat16
+```
+
+The GPU index and memory utilization may be adjusted for the target machine.
+
+In the terminal used to run ThinkGrasp-MuJoCo, configure the client:
+
+```bash
+export VLM_BASE_URL=http://127.0.0.1:8000/v1
+export VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct
+export OPENAI_API_KEY=EMPTY
+```
+
+Verify that the service is available before starting the closed loop:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models
+```
+
+The response should list:
 
 ```text
-http://127.0.0.1:8000/v1
+Qwen/Qwen3-VL-4B-Instruct
 ```
 
 The ThinkGrasp-style VLM system prompt used by this project is stored locally in:
@@ -189,16 +266,20 @@ third_party/GroundingDINO/
 
 The project therefore does not require the original parent ThinkGrasp repository at runtime.
 
-`run_groundingdino_inference.py` downloads the GroundingDINO configuration and checkpoint through `huggingface_hub` when required.
+`run_groundingdino_inference.py` uses the project-local GroundingDINO source.
 
-Current model files requested by the worker:
+Current model files requested by the worker are:
 
 ```text
 GroundingDINO_SwinB.cfg.py
 groundingdino_swinb_cogcoor.pth
 ```
 
-Compiled GroundingDINO extensions are not committed to Git and must be built or installed for the target environment.
+The GroundingDINO native extension is built by:
+
+```bash
+bash scripts/build_native_extensions.sh
+```
 
 ## GraspNet
 
@@ -224,7 +305,17 @@ graspnet_config.py
 
 The formal closed loop uses GraspNet point-cloud inference without semantic text input. Target association and source-style grasp filtering are performed by the MuJoCo pipeline after grasp generation.
 
-Compiled PointNet2 / KNN extensions and build artifacts are not committed to Git and must be built in the GraspNet environment.
+PointNet2 and KNN extensions are built by:
+
+```bash
+bash scripts/build_native_extensions.sh
+```
+
+Their project-local runtime copies are stored under:
+
+```text
+.native_runtime/
+```
 
 ## MuJoCo Assets
 
@@ -248,33 +339,110 @@ assets/scanned_objects/
 
 ## Headless MuJoCo
 
-For the current headless server configuration:
+For a headless server using OSMesa:
 
 ```bash
 export MUJOCO_GL=osmesa
 export PYOPENGL_PLATFORM=osmesa
 ```
 
-Then activate the MuJoCo environment.
+These values are also provided as defaults by:
+
+```bash
+source scripts/setup_runtime_env.sh
+```
+
+## Runtime Environment Setup
+
+After the native extensions have been built, configure the project runtime environment.
+
+First define machine-specific interpreter paths:
+
+```bash
+export LEGACY_PERCEPTION_PYTHON=/path/to/legacy/python3.8
+export GRASPNET_PYTHON="$LEGACY_PERCEPTION_PYTHON"
+```
+
+Then source the project setup script:
+
+```bash
+source scripts/setup_runtime_env.sh
+```
+
+The script configures:
+
+```text
+PROJECT_ROOT
+PYTHONPATH
+MUJOCO_GL
+PYOPENGL_PLATFORM
+VLM_BASE_URL
+VLM_MODEL
+OPENAI_API_KEY
+GRASPNET_PYTHON
+```
+
+Machine-specific absolute paths are intentionally not stored in the repository.
+
+## Installation Validation
+
+Before running the full closed loop, validate the installation:
+
+```bash
+python scripts/validate_installation.py
+```
+
+The validator checks:
+
+```text
+MuJoCo main environment
+Legacy perception Python / PyTorch / CUDA availability
+Project-local PointNet2 extension
+Project-local KNN extension
+Project-local GroundingDINO extension
+GraspNet checkpoint
+Required scanned-object assets
+Qwen vLLM endpoint
+```
+
+A fully configured installation should report:
+
+```text
+[PASS] MuJoCo main environment
+[PASS] Legacy perception Python
+[PASS] Native extensions
+[PASS] GraspNet checkpoint
+[PASS] Scanned-object assets
+[PASS] Qwen vLLM endpoint
+
+Validation result: PASS
+```
+
+A robosuite warning about the optional Mink-based whole-body IK controller for GR1 may appear during import. The current Panda pipeline uses its own IK and joint-position control path and does not rely on that GR1 controller.
 
 ## Running the Closed Loop
 
-Example:
+A minimal validated workflow is:
 
 ```bash
+# 1. Activate the MuJoCo environment.
 conda activate /path/to/thinkgrasp_mujoco
 
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
+# 2. Define machine-specific legacy environment paths.
+export LEGACY_PERCEPTION_PYTHON=/path/to/legacy/python3.8
+export GRASPNET_PYTHON="$LEGACY_PERCEPTION_PYTHON"
 
-export LEGACY_PERCEPTION_PYTHON=/path/to/legacy_python3.8
-export GRASPNET_PYTHON=/path/to/graspnet_python
+# 3. Configure the project runtime.
+source scripts/setup_runtime_env.sh
 
-export VLM_BASE_URL=http://127.0.0.1:8000/v1
-export VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct
+# 4. Verify the installation and Qwen service.
+python scripts/validate_installation.py
 
+# 5. Run the closed loop.
 python run_closed_loop.py
 ```
+
+The Qwen vLLM service must already be running in a separate terminal before the validator or closed-loop process is started.
 
 The current default testcase is:
 
@@ -306,6 +474,32 @@ The language instruction is used by the VLM / GroundingDINO / grasp-planning pip
 
 The simulator ground-truth object name is used only for final task-success evaluation and is not used to pre-filter VLM, GroundingDINO, or GraspNet predictions.
 
+## Recommended Setup Order
+
+For a clean clone, the recommended order is:
+
+```text
+Clone repository
+    ↓
+Create / activate MuJoCo main environment
+    ↓
+Prepare legacy perception / GraspNet environment
+    ↓
+Set LEGACY_PERCEPTION_PYTHON and CUDA_HOME
+    ↓
+Build native extensions
+    ↓
+Place GraspNet checkpoint
+    ↓
+Prepare and start Qwen3-VL with vLLM
+    ↓
+Source scripts/setup_runtime_env.sh
+    ↓
+Run scripts/validate_installation.py
+    ↓
+Run run_closed_loop.py
+```
+
 ## Runtime Outputs
 
 Runtime artifacts are generated under directories such as:
@@ -316,7 +510,7 @@ closed_loop_outputs/
 grasp_videos/
 ```
 
-Generated point clouds, NPZ files, PLY visualizations, videos, and logs are excluded from Git.
+Generated point clouds, NPZ files, PLY visualizations, videos, logs, compiled extensions, and other runtime artifacts are excluded from Git.
 
 ## Third-Party Components
 
@@ -356,5 +550,9 @@ Current validated components include:
 - simulator-side grasp-success evaluation
 - retry-based closed-loop execution
 - grasp and perception debugging outputs
+- project-local native extension build workflow
+- clean-clone standalone validation workflow
+
+A clean-clone standalone validation has confirmed that the main perception and execution chain can run without importing code from the original parent ThinkGrasp repository.
 
 The project is under active development as part of a bachelor thesis on VLM-based robotic grasping and simulation migration.
