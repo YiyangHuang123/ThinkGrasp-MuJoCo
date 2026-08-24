@@ -1,0 +1,2 @@
+Pick up the gaming mouse and place it in the bin.
+gaming_mouse

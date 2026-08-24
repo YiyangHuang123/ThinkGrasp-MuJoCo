@@ -89,8 +89,7 @@ def run_graspnet_inference(
             cuda_visible_devices
         )
 
-    print("Running GraspNet subprocess:")
-    print(" ".join(command))
+    print("Running GraspNet.")
 
     completed = subprocess.run(
         command,
@@ -100,16 +99,28 @@ def run_graspnet_inference(
         capture_output=True,
     )
 
-    if completed.stdout:
-        print(completed.stdout, end="")
-
     if completed.returncode != 0:
+        if completed.stdout:
+            print(completed.stdout, end="")
         if completed.stderr:
             print(completed.stderr, end="")
 
         raise RuntimeError(
             "GraspNet subprocess failed with return code "
             f"{completed.returncode}"
+        )
+
+    summary_lines = [
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("GRASPNET_SUMMARY ")
+    ]
+    if summary_lines:
+        print(
+            summary_lines[-1].replace(
+                "GRASPNET_SUMMARY ",
+                "GraspNet: ",
+            )
         )
 
     if not output_path.exists():

@@ -62,8 +62,9 @@ def save_vlm_selection_visualization(
     selected_object,
     preferred_location,
     output_path,
+    centroid_xy=None,
 ):
-    """Save a purple-box visualization of the VLM output."""
+    """Save a visualization of the VLM selection result."""
 
     image = _to_uint8_rgb(image)
     output_path = Path(output_path)
@@ -99,43 +100,111 @@ def save_vlm_selection_visualization(
         fill=purple_fill,
     )
 
-    label_text = (
-        f"VLM: {selected_object} | Pref: {preferred_location}"
-    )
-    _draw_text_with_background(
-        draw,
-        (x1, max(0, y1 - 18)),
-        label_text,
-        text_fill=white,
-        background_fill=(80, 20, 140, 235),
+    # VLM centroid: draw only a red marker on the image.
+    # Text is kept in a separate annotation box to avoid clutter.
+    if centroid_xy is not None:
+        centroid_x, centroid_y = [
+            int(round(v))
+            for v in centroid_xy
+        ]
+
+        centroid_x = max(
+            0,
+            min(canvas.width - 1, centroid_x),
+        )
+        centroid_y = max(
+            0,
+            min(canvas.height - 1, centroid_y),
+        )
+
+        centroid_radius = 6
+
+        draw.ellipse(
+            [
+                centroid_x - centroid_radius,
+                centroid_y - centroid_radius,
+                centroid_x + centroid_radius,
+                centroid_y + centroid_radius,
+            ],
+            fill=(255, 0, 0, 255),
+            outline=white,
+            width=2,
+        )
+
+        centroid_text = (
+            f"({centroid_x}, {centroid_y})"
+        )
+    else:
+        centroid_text = "N/A"
+
+    # Keep semantic annotations away from the centroid marker itself.
+    # A fixed information box makes repeated attempts easier to compare.
+    info_lines = [
+        f"Selected: {selected_object}",
+        f"Centroid: {centroid_text}",
+        f"Preferred: {preferred_location}",
+    ]
+
+    font = _load_default_font()
+    info_x = 6
+    info_y = 6
+    line_gap = 3
+    padding = 5
+
+    line_boxes = [
+        draw.textbbox(
+            (0, 0),
+            line,
+            font=font,
+        )
+        for line in info_lines
+    ]
+
+    line_widths = [
+        box[2] - box[0]
+        for box in line_boxes
+    ]
+    line_heights = [
+        box[3] - box[1]
+        for box in line_boxes
+    ]
+
+    info_width = max(line_widths)
+    info_height = (
+        sum(line_heights)
+        + line_gap * (len(info_lines) - 1)
     )
 
-    badge_size = 24
-    badge_left = min(
-        canvas.width - badge_size - 2,
-        max(2, x2 + 8),
-    )
-    badge_top = max(2, y1)
     draw.rounded_rectangle(
         [
-            badge_left,
-            badge_top,
-            badge_left + badge_size,
-            badge_top + badge_size,
+            info_x - padding,
+            info_y - padding,
+            info_x + info_width + padding,
+            info_y + info_height + padding,
         ],
-        radius=6,
-        fill=(110, 0, 200, 235),
+        radius=5,
+        fill=(80, 20, 140, 225),
         outline=white,
-        width=2,
+        width=1,
     )
-    _draw_text_with_background(
-        draw,
-        (badge_left + 6, badge_top + 4),
-        str(preferred_location),
-        text_fill=white,
-        background_fill=(0, 0, 0, 0),
-        padding=0,
-    )
+
+    current_y = info_y
+
+    for line, line_height in zip(
+        info_lines,
+        line_heights,
+    ):
+        draw.text(
+            (info_x, current_y),
+            line,
+            fill=white,
+            font=font,
+        )
+
+        current_y += (
+            line_height
+            + line_gap
+        )
 
     merged = Image.alpha_composite(
         canvas,

@@ -1,0 +1,2 @@
+Pick up the moisturizer jar and place it in the bin.
+moisturizer_jar

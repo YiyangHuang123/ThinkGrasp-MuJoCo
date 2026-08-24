@@ -57,6 +57,87 @@ def _thinkgrasp_nullspace_torques(
 robosuite_osc.nullspace_torques = _thinkgrasp_nullspace_torques
 
 
+
+# ---------------------------------------------------------------------------
+# Fixed GSO object sets for comparable multi-scene experiments.
+#
+# Scene01 is the original baseline scene. Scene02..Scene10 change only the
+# five loaded GSO objects; robot, table, cameras, workspace, clutter-drop
+# procedure, controller, bin, reward path, and task logic remain unchanged.
+# ---------------------------------------------------------------------------
+GSO_SCENE_OBJECT_SPECS = {
+    "scene01": [
+        {"name": "coffee_mug", "model_dir": "ACE_Coffee_Mug_Kristen_16_oz_cup"},
+        {"name": "ecoforms_cup", "model_dir": "Ecoforms_Cup_B4_SAN"},
+        {"name": "circo_holder", "model_dir": "Circo_Fish_Toothbrush_Holder_14995988"},
+        {"name": "white_ramekin", "model_dir": "BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup"},
+        {"name": "ink_cartridge", "model_dir": "Canon_Pixma_Ink_Cartridge_8"},
+    ],
+    "scene02": [
+        {"name": "black_bowl", "model_dir": "Now_Designs_Bowl_Akita_Black"},
+        {"name": "nesquik_canister", "model_dir": "Nestle_Nesquik_Chocolate_Powder_Flavored_Milk_Additive_109_Oz_Canister"},
+        {"name": "crayon_box", "model_dir": "Crayola_Bonus_64_Crayons"},
+        {"name": "nikon_camera", "model_dir": "Nikon_1_AW1_w11275mm_Lens_Silver"},
+        {"name": "bunny_racer", "model_dir": "BUNNY_RACER"},
+    ],
+    "scene03": [
+        {"name": "white_cereal_bowl", "model_dir": "Threshold_Bead_Cereal_Bowl_White"},
+        {"name": "latte_box", "model_dir": "Nescafe_Memento_Latte_Caramel_8_08_oz_23_g_packets_64_oz_184_g"},
+        {"name": "green_speaker", "model_dir": "JBL_Charge_Speaker_portable_wireless_wired_Green"},
+        {"name": "mario_figure", "model_dir": "Nintendo_Mario_Action_Figure"},
+        {"name": "can_opener", "model_dir": "OXO_Soft_Works_Can_Opener_SnapLock"},
+    ],
+    "scene04": [
+        {"name": "turquoise_bowl", "model_dir": "Room_Essentials_Bowl_Turquiose"},
+        {"name": "fondant_box", "model_dir": "ReadytoUse_Rolled_Fondant_Pure_White_24_oz_box"},
+        {"name": "blue_bottle", "model_dir": "Perricone_MD_Cold_Plasma_Body"},
+        {"name": "baby_car", "model_dir": "BABY_CAR"},
+        {"name": "alarm_clock", "model_dir": "Crosley_Alarm_Clock_Vintage_Metal"},
+    ],
+    "scene05": [
+        {"name": "yellow_blue_bowl", "model_dir": "Cole_Hardware_Bowl_Scirocco_YellowBlue"},
+        {"name": "mocha_box", "model_dir": "Nescafe_Momento_Mocha_Specialty_Coffee_Mix_8_ct"},
+        {"name": "gaming_mouse", "model_dir": "Razer_Abyssus_Ambidextrous_Gaming_Mouse"},
+        {"name": "yoshi_figure", "model_dir": "Nintendo_Yoshi_Action_Figure"},
+        {"name": "black_ink_box", "model_dir": "Office_Depot_Canon_PG21XL_Remanufactured_Ink_Cartridge_Black"},
+    ],
+    "scene06": [
+        {"name": "quercetin_bottle", "model_dir": "Quercetin_500"},
+        {"name": "cookie_candy_box", "model_dir": "Nestl_Crunch_Girl_Scouts_Cookie_Flavors_Caramel_Coconut_78_oz_box"},
+        {"name": "fire_truck", "model_dir": "FIRE_TRUCK"},
+        {"name": "moisturizer_jar", "model_dir": "Perricone_MD_Face_Finishing_Moisturizer_4_oz"},
+        {"name": "pencil_case", "model_dir": "Big_Dot_Aqua_Pencil_Case"},
+    ],
+    "scene07": [
+        {"name": "probiotic_bottle", "model_dir": "JarroDophilusFOS_Value_Size"},
+        {"name": "snack_dispenser", "model_dir": "Snack_Catcher_Snack_Dispenser"},
+        {"name": "rhino_figure", "model_dir": "Schleich_African_Black_Rhino"},
+        {"name": "color_ink_box", "model_dir": "Brother_LC_1053PKS_Ink_Cartridge_CyanMagentaYellow_1pack"},
+        {"name": "hard_drive", "model_dir": "Deskstar_Desk_Top_Hard_Drive_1_TB"},
+    ],
+    "scene08": [
+        {"name": "creatine_bottle", "model_dir": "Twinlab_Nitric_Fuel"},
+        {"name": "fujifilm_camera_box", "model_dir": "Fujifilm_instax_SHARE_SP1_10_photos"},
+        {"name": "speed_boat", "model_dir": "SPEED_BOAT"},
+        {"name": "face_moisturizer", "model_dir": "Perricone_MD_Face_Finishing_Moisturizer"},
+        {"name": "peanut_butter_candy_box", "model_dir": "Nestle_Nips_Hard_Candy_Peanut_Butter"},
+    ],
+    "scene09": [
+        {"name": "neck_cream_jar", "model_dir": "Perricone_MD_Firming_Neck_Therapy_Treatment"},
+        {"name": "lion_figure", "model_dir": "Schleich_Lion_Action_Figure"},
+        {"name": "soap_dish", "model_dir": "Threshold_Bamboo_Ceramic_Soap_Dish"},
+        {"name": "pink_rubber_toy", "model_dir": "Kong_Puppy_Teething_Rubber_Small_Pink"},
+        {"name": "bunny_racer", "model_dir": "BUNNY_RACER"},
+    ],
+    "scene10": [
+        {"name": "borage_bottle", "model_dir": "Borage_GLA240Gamma_Tocopherol"},
+        {"name": "toy_airplane", "model_dir": "TURBOPROP_AIRPLANE_WITH_PILOT"},
+        {"name": "game_case", "model_dir": "Kid_Icarus_Uprising_Nintendo_3DS_Game"},
+        {"name": "crocodile_toy", "model_dir": "My_First_Wiggle_Crocodile"},
+        {"name": "cleanser_bottle", "model_dir": "Perricone_MD_Nutritive_Cleanser"},
+    ],
+}
+
 # ---------------------------------------------------------------------------
 # Validated Panda IK + JOINT_POSITION control configuration
 # ---------------------------------------------------------------------------
@@ -106,7 +187,7 @@ IK_JOINT_KP = 300.0
 IK_JOINT_DAMPING_RATIO = 1.0
 IK_CARTESIAN_WAYPOINT_SPACING = 0.01
 
-# Experimental execution-quality gate for non-strict IK solutions.
+# Execution-quality gate for non-strict IK solutions.
 #
 # residual_threshold=1e-5 remains unchanged and continues to define strict
 # solver convergence. A non-converged multi-start result may still be
@@ -117,23 +198,16 @@ IK_CARTESIAN_WAYPOINT_SPACING = 0.01
 IK_BEST_EFFORT_MAX_POSITION_ERROR_M = 0.010
 IK_BEST_EFFORT_MAX_ORIENTATION_ERROR_DEG = 2.0
 
-# Source-inspired end-effector force-stop for grasp descent.
-# Original PyBullet ThinkGrasp uses max_force=300 on
-# sum(abs([Fx, Fy, Fz, Mx, My, Mz])). robosuite's Panda gripper already
-# provides force_ee and torque_ee sensors, so MuJoCo can build the same
-# six-component metric. Requiring consecutive threshold crossings avoids
+# End-effector force-stop for grasp descent.
+# The stopping metric is the sum of absolute values of the six-component
+# end-effector wrench. Requiring consecutive threshold crossings avoids
 # reacting to a one-step impact spike.
 PYBULLET_STYLE_GRASP_FORCE_THRESHOLD = 15.0
 GRASP_FORCE_STOP_CONSECUTIVE_STEPS = 5
 
 
 def load_thinkgrasp_joint_position_controller_config():
-    """Return the validated Panda JOINT_POSITION composite config.
-
-    This helper is intentionally separate from the existing OSC default.
-    run_closed_loop.py can opt into this controller later without changing
-    the OSC path or the installed robosuite package.
-    """
+    """Return the Panda JOINT_POSITION composite controller config."""
 
     config = load_composite_controller_config(
         controller="BASIC"
@@ -173,17 +247,24 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         camera_depths=True,
         camera_segmentations="instance",
         hard_reset=True,
+        scene_name="scene01",
         **kwargs,
     ):
         self.table_full_size = (0.8, 0.8, 0.05)
         self.table_friction = (1.0, 5e-3, 1e-4)
         self.table_offset = np.array((0.07, 0.0, 0.83))
 
-        # Symmetric oblique perception cameras around the clutter centre.
-        # Both cameras use the same distance, height, FOV, and approximately
-        # 25-degree downward viewing angle. They differ only by the sign of Y.
+        # Front / left / right oblique perception cameras around the clutter centre.
+        # All three use matched distance, height, FOV, and approximately
+        # 25-degree downward viewing geometry.
         self.left_oblique_camera_name = "left_oblique_25deg"
         self.right_oblique_camera_name = "right_oblique_25deg"
+        self.front_oblique_camera_name = "front_oblique_25deg"
+
+        self.front_oblique_camera_position = np.array(
+            [0.87, 0.00, 1.26304662],
+            dtype=np.float64,
+        )
 
         self.left_oblique_camera_position = np.array(
             [0.07, 0.80, 1.26304662],
@@ -200,19 +281,12 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
         self.oblique_camera_pitch_deg = 25.0
 
-        # The formal workspace is NOT hard-coded here. Its XY bounds are
-        # derived from the fixed purple top-view crop after the MuJoCo camera
-        # model exists, then the Panda-facing X-min edge is moved inward 5 cm.
-        # See _get_perception_workspace_limits().
+        # The perception workspace is resolved through
+        # _get_perception_workspace_limits().
 
-        # Initial clutter construction keeps the original ThinkGrasp /
-        # PyBullet idea of independent XY sampling + sequential drop + settle,
-        # but uses a MuJoCo-specific compact drop rectangle so five household
-        # objects remain clustered without being forced into one pile point.
-        #
-        # The larger purple FIXED_PERCEPTION_CROP_XYXY remains the final
-        # legality region. If any settled object leaves that purple workspace,
-        # the complete clutter scene is regenerated.
+        # Initial clutter construction independently samples object XY
+        # positions, then drops and settles objects sequentially inside a compact
+        # MuJoCo drop rectangle. Invalid scenes are regenerated.
         self.object_drop_world_bounds = np.array(
             [
                 [0.10, 0.18],
@@ -222,9 +296,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
         self.object_drop_height_above_table = 0.18
 
-        # Google Scanned Objects used in the formal clutter scene.
-        # Keep semantic internal names so the VLM / runner can map natural
-        # language selections to stable MuJoCo object identifiers.
+        # Google Scanned Objects used in the selected clutter scene.
         self.gso_models_root = (
             Path(__file__).resolve().parent
             / "assets"
@@ -237,31 +309,20 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             / "scanned_objects"
             / "robosuite_adapters"
         )
+
+        self.scene_name = str(scene_name).strip().lower()
+
+        if self.scene_name not in GSO_SCENE_OBJECT_SPECS:
+            raise ValueError(
+                f"Unknown scene_name {self.scene_name!r}. "
+                f"Available scenes: {sorted(GSO_SCENE_OBJECT_SPECS)}"
+            )
+
         self.gso_object_specs = [
-            {
-                "name": "coffee_mug",
-                "model_dir": "ACE_Coffee_Mug_Kristen_16_oz_cup",
-            },
-            {
-                "name": "ecoforms_cup",
-                "model_dir": "Ecoforms_Cup_B4_SAN",
-            },
-            {
-                "name": "circo_holder",
-                "model_dir": "Circo_Fish_Toothbrush_Holder_14995988",
-            },
-            {
-                "name": "white_ramekin",
-                "model_dir": (
-                    "BIA_Porcelain_Ramekin_With_Glazed_Rim_"
-                    "35_45_oz_cup"
-                ),
-            },
-            {
-                "name": "ink_cartridge",
-                "model_dir": "Canon_Pixma_Ink_Cartridge_8",
-            },
+            dict(object_spec)
+            for object_spec in GSO_SCENE_OBJECT_SPECS[self.scene_name]
         ]
+
         self.object_drop_min_steps = 220
         self.object_drop_max_steps = 1400
         self.object_drop_check_interval = 20
@@ -274,8 +335,8 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         self.object_table_validity_margin_xy = 0.02
         self.object_table_validity_z_tolerance = 0.04
 
-        # 机器人面向桌面时，左侧（世界坐标 +Y）的小型接收框。
-        # 框体位于桌子外侧，框口略低于桌面。
+        # Fixed receiving bin on the robot's left side (world +Y).
+        # The bin is outside the tabletop with its opening below table height.
         self.bin_center = np.array(
             [0.07, 0.40],
             dtype=np.float64,
@@ -288,7 +349,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         self.bin_floor_top_z = 0.61
         self.bin_top_z = 0.81
 
-        # 夹爪移动到该位置后打开，让物体落入框内。
+        # Release position above the receiving bin.
         self.bin_release_position = np.array(
             [
                 self.bin_center[0],
@@ -319,15 +380,14 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             **kwargs,
         )
 
-        # Build the one official MuJoCo workspace from the calibrated purple
-        # crop + Panda-side 5 cm margin. All formal perception / GraspNet
-        # paths consume this single runtime-derived 3D box.
+        # Build the runtime MuJoCo perception workspace.
+        # Perception and GraspNet paths share this single 3D box.
         self.perception_workspace_limits = (
             self._get_perception_workspace_limits()
         )
 
-        # robosuite自身使用render_camera作为实例变量，
-        # 会遮蔽ThinkGrasp需要的render_camera()方法。
+        # robosuite stores render_camera as an instance attribute,
+        # which shadows the custom render_camera() method below.
         self._robosuite_render_camera = self.render_camera
         del self.render_camera
 
@@ -349,8 +409,8 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
         arena.set_origin([0, 0, 0])
 
-        # 固定顶部相机：位于桌面中心正上方，光轴垂直向下。
-        # MuJoCo相机默认沿局部-Z方向观察，因此这里使用单位四元数。
+        # Fixed top-view camera above the table centre, looking vertically down.
+        # MuJoCo cameras look along local -Z, so the identity quaternion is used.
         topview_camera = ET.Element(
             "camera",
             attrib={
@@ -363,9 +423,27 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
         arena.worldbody.append(topview_camera)
 
-        # Symmetric left / right oblique cameras.
+        # Front / left / right oblique cameras with matched viewing geometry.
+        # All three use the same 0.80 m horizontal distance,
+        # the same height, the same approximately 25-degree
+        # downward viewing angle, and the same 45-degree FOV.
+        #
         # Quaternion order in MuJoCo XML is w x y z.
-        # The two quaternions are mirrored across the XZ plane.
+        front_oblique_camera = ET.Element(
+            "camera",
+            attrib={
+                "name": self.front_oblique_camera_name,
+                "mode": "fixed",
+                "pos": " ".join(
+                    str(float(value))
+                    for value in self.front_oblique_camera_position
+                ),
+                "quat": "0.59636781 -0.37992820 0.37992820 -0.59636781",
+                "fovy": "45",
+            },
+        )
+        arena.worldbody.append(front_oblique_camera)
+
         left_oblique_camera = ET.Element(
             "camera",
             attrib={
@@ -396,8 +474,8 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
         arena.worldbody.append(right_oblique_camera)
 
-        # 桌子左侧的固定接收框。
-        # 使用一个底板和四面矮墙组成，参与真实碰撞。
+        # Fixed receiving bin on the left side of the table.
+        # Built from one floor and four low collision walls.
         bin_half_x = float(self.bin_inner_half_size[0])
         bin_half_y = float(self.bin_inner_half_size[1])
         wall_t = float(self.bin_wall_thickness)
@@ -774,7 +852,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             for name, body_id in self.object_body_ids.items()
         }
 
-        # 与旧ThinkGrasp环境保持兼容的物体ID结构
+        # Compatibility object-ID structure.
         self.obj_ids = {
             "fixed": [],
             "rigid": list(self.object_body_ids.values()),
@@ -821,7 +899,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         self._capture_robot_initialization_state()
 
         try:
-            # Formal GSO clutter scene:
+            # GSO clutter scene:
             # sample each object independently inside the approved perception
             # workspace, then drop and settle objects one by one.
             self._build_initial_clutter_by_center_drop()
@@ -1065,7 +1143,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
                perception workspace;
             3. every sequential drop reported settled=True.
 
-        Any failure regenerates the complete five-object scene.
+        Any failure regenerates the complete selected scene.
         """
 
         table_top_z = float(
@@ -1105,9 +1183,9 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             self._get_perception_workspace_world_bounds()
         )
 
-        # Scene-valid region: centred scaled copy of the FINAL official
+        # Scene-valid region: centred scaled copy of the runtime
         # workspace. This is only an initial clutter acceptance constraint;
-        # it does NOT shrink the formal perception / GraspNet workspace.
+        # it does not shrink the perception / GraspNet workspace.
         workspace_center = np.mean(
             perception_bounds,
             axis=1,
@@ -1278,11 +1356,10 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
 
     def _get_perception_workspace_world_bounds(self):
-        """Return the one fixed official tabletop world-XY workspace.
+        """Return the configured tabletop world-XY workspace.
 
-        The historical Panda-facing X-min 5 cm adjustment has already been
-        absorbed into OFFICIAL_WORKSPACE_XY_BOUNDS. No runtime edge patch is
-        applied here.
+        The Panda-facing X-min margin is already included in
+        OFFICIAL_WORKSPACE_XY_BOUNDS.
         """
 
         bounds = np.asarray(
@@ -1299,7 +1376,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
 
 
     def _get_perception_workspace_limits(self):
-        """Return the one official 3D MuJoCo workspace as [[x],[y],[z]]."""
+        """Return the configured 3D MuJoCo workspace as [[x],[y],[z]]."""
 
         xy_bounds = self._get_perception_workspace_world_bounds()
         z_bounds = np.asarray(
@@ -1339,12 +1416,11 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
 
 
-
     def _build_initial_clutter_by_center_drop(self):
         """Build clutter using PyBullet-style workspace-random dropping.
 
         For every attempt:
-            1. park all five objects away from the table;
+            1. park all selected objects away from the table;
             2. independently sample each object's XY inside the compact
                MuJoCo drop rectangle;
             3. drop one object;
@@ -1472,10 +1548,9 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             )
 
         raise RuntimeError(
-            "Failed to generate a valid five-object GSO clutter scene "
+            "Failed to generate a valid GSO clutter scene "
             f"after {self.object_clutter_max_retries} attempts."
         )
-
 
 
     def get_gripper_width(self):
@@ -1537,7 +1612,6 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
 
 
-
     def has_gripper_table_contact(self):
         """Return True when any Panda gripper geom contacts the table."""
 
@@ -1585,14 +1659,11 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         return False
 
     def get_eef_force_torque_wrench(self):
-        """Read robosuite Panda end-effector force / torque sensors.
+        """Read Panda end-effector force / torque sensors.
 
-        The original PyBullet code reads a 6D end-effector reaction wrench
-        and computes sum(abs(wrench)). Here we use robosuite's built-in
-        force_ee and torque_ee MuJoCo sensors and apply the same reduction.
-        The resulting scalar intentionally mixes force and torque units, just
-        like the source code, so it is a source-style stopping metric rather
-        than a quantity measured purely in newtons.
+        The stopping metric is computed as sum(abs(wrench)) over the built-in
+        force_ee and torque_ee MuJoCo sensors. The resulting scalar mixes force
+        and torque units and is used only as a control threshold metric.
         """
 
         def _sensor_values_by_suffix(suffix):
@@ -1768,10 +1839,10 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         Returns:
             dict with convergence diagnostics and the best joint solution.
 
-        PyBullet-faithful execution policy:
+        Execution policy:
             - residual_threshold is used only for early convergence;
             - reaching max_iterations without satisfying the threshold does
-              NOT automatically forbid execution;
+              not automatically forbid execution;
             - downstream JOINT_POSITION execution may still try the best
               finite joint solution returned here.
         """
@@ -2273,18 +2344,14 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             )
         ]
 
-        # PyBullet-style continuity preference:
+        # Continuity-first IK preference:
         #
-        # Seed 0 is always the current / caller-supplied Panda joint
+        # Seed 0 is always the current or caller-supplied Panda joint
         # configuration. During straight Cartesian motion this is therefore
         # the solution reached for the preceding waypoint.
         #
         # If seed 0 already gives a practically acceptable Cartesian pose,
-        # keep that same joint branch instead of replacing it merely because
-        # another multi-start seed has a slightly smaller residual.
-        #
-        # Only when seed 0 is not usable enough do the remaining seeds act
-        # as the MuJoCo-specific fallback.
+        # keep that joint branch. Other seeds are used only as fallback.
         continuity_candidate = candidate_results[0]
         continuity_result = continuity_candidate["result"]
 
@@ -2327,8 +2394,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             best_candidate["result"]
         )
 
-        # Preserve diagnostics so we can inspect whether
-        # multi-start actually helped.
+        # Preserve multi-start diagnostics.
         best_result.update(
             {
                 "multi_start": True,
@@ -2948,22 +3014,9 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
 
             if candidates:
                 print(
-                    "MULTI-START IK CANDIDATES:"
+                    "IK multi-start rejected:",
+                    f"{len(candidates)} candidates evaluated"
                 )
-
-                for candidate in candidates:
-                    print(
-                        "  seed "
-                        f"{candidate['seed_index']}: "
-                        f"pos="
-                        f"{1000.0 * candidate['position_error_norm']:.3f} mm, "
-                        f"ori="
-                        f"{candidate['orientation_error_deg']:.3f} deg, "
-                        f"residual="
-                        f"{candidate['residual']:.6f}, "
-                        f"converged="
-                        f"{candidate['converged']}"
-                    )
 
             ik_result = dict(ik_result)
             ik_result[
@@ -3292,13 +3345,11 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
     ):
         """Close the Panda gripper until its motion becomes stable.
 
-        Source-inspired equivalent of the original PyBullet gripper logic:
-        keep commanding close while the gripper is still moving, and stop
-        once the gripper position has remained effectively unchanged for a
-        short consecutive window.
+        Keep commanding close while the gripper is moving, and stop once
+        the gripper width remains effectively unchanged for a short
+        consecutive window.
 
         This function is independent of the grasp-descent force-stop logic.
-        The force-stop has already completed before this close phase starts.
         """
 
         action = np.zeros(
@@ -3436,12 +3487,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         steps=30,
         frame_callback=None,
     ):
-        """Apply gripper command and optionally record every control step.
-
-        This preserves the physical gripper behavior of command_gripper(),
-        while fixing the earlier video artifact in which all intermediate
-        finger-closing frames were skipped.
-        """
+        """Apply a gripper command and optionally record every control step."""
 
         action = np.zeros(
             self.action_dim,
@@ -3483,25 +3529,14 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         stop_after_pregrasp=False,
         stop_after_grasp_pose=False,
     ):
-        """Execute one ThinkGrasp 7D grasp with IK + JOINT_POSITION.
+        """Execute one 7D grasp with IK + JOINT_POSITION.
 
-        This is the new control path. The existing execute_grasp_pose()
-        remains the OSC rollback path.
+        The pregrasp position preserves grasp X-Y and orientation while
+        raising the target along world +Z. The subsequent straight_move_ik()
+        descends through Cartesian waypoints while preserving orientation.
 
-        Match the original PyBullet ThinkGrasp execution geometry:
-        the over / pregrasp position keeps grasp X-Y and grasp orientation,
-        while raising position by pregrasp_height along WORLD +Z. The
-        subsequent straight_move_ik() therefore descends vertically in
-        Cartesian 1 cm waypoints while preserving the grasp orientation.
-
-        Diagnostic flags let run_closed_loop.py validate integration in
-        stages:
-            stop_after_pregrasp=True
-                current/home -> pregrasp only
-            stop_after_grasp_pose=True
-                current/home -> pregrasp -> straight grasp, but do not close
-            both False
-                complete close + lift
+        Optional diagnostic flags can stop execution after pregrasp or after
+        reaching the grasp pose.
         """
 
         grasp_pose = np.asarray(
@@ -3530,9 +3565,8 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             * approach_direction
         )
 
-        # Original PyBullet ThinkGrasp:
-        #   over = (grasp_x, grasp_y, grasp_z + 0.20)
-        # This is WORLD +Z, not a retreat along the local approach axis.
+        # Pregrasp offset is applied along world +Z, not along
+        # the local approach axis.
         pregrasp_pose = (
             grasp_eef_pose.copy()
         )
@@ -3557,12 +3591,8 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             )
         )
 
-        # PyBullet-faithful execution:
-        # do NOT force the robot through the migration-only fixed
-        # IK_SAFE_REST_JOINTS configuration before solving the over/pregrasp
-        # pose. Our controlled seed test showed that this extra safe-rest
-        # seed can drive the local IK solver into the same poor solution seen
-        # in closed-loop execution, while the home/current seed converges.
+        # Solve pregrasp directly from the current/home joint state.
+        # The optional safe-rest posture is not inserted before this motion.
         safe_rest_result = None
 
         pregrasp_result = (
@@ -3718,7 +3748,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         )
 
         print(
-            "PyBullet-style gripper close:",
+            "Gripper close:",
             {
                 "steps": close_result["steps"],
                 "stable": close_result["stable"],
@@ -4376,7 +4406,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
                 1.0,
             )
 
-            # action[3:6]保持为0，不主动改变末端姿态
+            # Keep action[3:6] at zero so orientation is not actively changed.
             action[-1] = np.clip(
                 gripper_command,
                 -1.0,
@@ -4397,9 +4427,6 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             "final_position": final_position,
             "position_error": final_error,
         }
-
-
-
 
 
     def safe_return_home(
@@ -4841,15 +4868,15 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
 
         object_name = self.body_id_to_name[obj_id]
 
-        # 先打开夹爪并让场景继续仿真，使物体稳定落到桌面。
+        # Open the gripper and let the scene settle before reading the object pose.
         open_result = self.open_gripper(steps=30)
 
-        # 必须在物体稳定后读取位置，避免使用初始化时偏高的位置。
+        # Read the object position only after settling.
         object_start = self.sim.data.body_xpos[obj_id].copy()
 
-        # 临时几何启发式垂直抓取策略：
-        # 抓取高度 = 物体半高 - 5 mm。
-        # 后续接入GraspNet后，应由GraspNet输出的6D抓取位姿替代。
+        # Simple geometric vertical-grasp heuristic:
+        # grasp height = half object height - 5 mm.
+        # The GraspNet path uses its predicted grasp pose instead.
         if grasp_height_offset is None:
             _, _, dimensions = self.obj_info(obj_id)
             object_height = float(dimensions[2])
@@ -4975,7 +5002,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             to="xyzw",
         )
 
-        # The formal GraspNet path does not depend on this heuristic size.
+        # The GraspNet path does not depend on this heuristic size.
         # Keep grasp_object() backward compatible by returning a conservative
         # bounding diameter derived from all geoms belonging to this object's
         # body subtree.
@@ -5068,8 +5095,6 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         return transforms
 
 
-
-
     def get_camera_intrinsics(
         self,
         camera_name="agentview",
@@ -5135,7 +5160,7 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
 
         z = depth.astype(np.float64)
 
-        # MuJoCo渲染图像的垂直像素方向与相机投影坐标相反
+        # MuJoCo image rows use the opposite vertical convention to camera projection.
         v_corrected = height - 1 - v
 
         x = (u - cx) * z / fx
@@ -5325,6 +5350,18 @@ def main():
         )
 
         (
+            front_oblique_rgb,
+            front_oblique_depth,
+            front_oblique_segmentation,
+        ) = env.render_camera(
+            {
+                "camera_name": env.front_oblique_camera_name,
+                "width": 640,
+                "height": 480,
+            }
+        )
+
+        (
             right_oblique_rgb,
             right_oblique_depth,
             right_oblique_segmentation,
@@ -5367,7 +5404,12 @@ def main():
         )
 
         imageio.imwrite(
-            workspace_preview_dir / "right_oblique_15deg_rgb.png",
+            workspace_preview_dir / "front_oblique_25deg_rgb.png",
+            front_oblique_rgb,
+        )
+
+        imageio.imwrite(
+            workspace_preview_dir / "right_oblique_25deg_rgb.png",
             right_oblique_rgb,
         )
 
@@ -5383,7 +5425,7 @@ def main():
             right_oblique_depth_normalized /= depth_range
 
         imageio.imwrite(
-            workspace_preview_dir / "right_oblique_15deg_depth.png",
+            workspace_preview_dir / "right_oblique_25deg_depth.png",
             np.clip(
                 right_oblique_depth_normalized * 255.0,
                 0.0,
@@ -5410,12 +5452,12 @@ def main():
             env.right_oblique_camera_position,
         )
         print(
-            "Right oblique camera target:",
-            env.right_oblique_camera_target,
+            "Oblique camera target:",
+            env.oblique_camera_target,
         )
         print(
-            "Right oblique downward pitch degrees:",
-            env.right_oblique_camera_pitch_deg,
+            "Oblique downward pitch degrees:",
+            env.oblique_camera_pitch_deg,
         )
         print(
             "Right oblique RGB:",
@@ -5452,11 +5494,11 @@ def main():
         )
         print(
             "Saved:",
-            workspace_preview_dir / "right_oblique_15deg_rgb.png",
+            workspace_preview_dir / "right_oblique_25deg_rgb.png",
         )
         print(
             "Saved:",
-            workspace_preview_dir / "right_oblique_15deg_depth.png",
+            workspace_preview_dir / "right_oblique_25deg_depth.png",
         )
 
     finally:

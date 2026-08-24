@@ -1,14 +1,19 @@
-"""Minimal ThinkGrasp-style closed loop in MuJoCo.
+"""Closed-loop robotic grasping in MuJoCo.
 
 Pipeline:
-    fixed testcase (language goal + simulator GT target)
-    -> MuJoCo perception
-    -> GraspNet subprocess
-    -> assign grasps to nearby objects and select by DINO preferred location
-    -> Panda execution
-    -> success check
-    -> on failure: recover, then re-perceive and re-plan
-       (one selected grasp per perception cycle, PyBullet-style)
+    language goal
+    -> MuJoCo RGB-D perception
+    -> Qwen3-VL target selection
+    -> GroundingDINO target localization
+    -> GraspNet grasp generation
+    -> target-region grasp ranking
+    -> Panda IK + JOINT_POSITION execution
+    -> fixed joint-space transport
+    -> simulator-side task evaluation
+    -> re-perception and re-planning on failure
+
+If the target region contains no usable grasp, a four-view full-scene
+fallback grasp is used to perturb the clutter before the next cycle.
 """
 
 from pathlib import Path
@@ -21,7 +26,7 @@ import traceback
 
 import imageio.v2 as imageio
 import numpy as np
-from robosuite.controllers import load_composite_controller_config
+from PIL import Image, ImageDraw, ImageFont
 
 from graspnet_bridge import (
     load_target_grasp_data,
@@ -29,26 +34,24 @@ from graspnet_bridge import (
 )
 from dual_view_recorder import DualViewRecorder
 from scene_bridge import (
-    FIXED_PERCEPTION_CROP_XYXY,
     build_pybullet_style_heightmap,
     export_colored_pointcloud_ply,
     export_pybullet_style_target_scene,
 )
 from thinkgrasp_minimal_env import (
+    GSO_SCENE_OBJECT_SPECS,
     ThinkGraspMinimalEnv,
     load_thinkgrasp_joint_position_controller_config,
 )
 from vlm_bridge import run_vlm_selection
 from perception_viz import (
-    save_grounding_grid_visualization,
     save_vlm_selection_visualization,
 )
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR
 
-# PyBullet-style fixed test cases.
+# Fixed test cases.
 # Line 1: natural-language goal for VLM.
 # Line 2: simulator GT target object name, used ONLY for final success check.
 CASE_DIR = SCRIPT_DIR / "cases"
@@ -58,24 +61,19 @@ BRIDGE_DIR = SCRIPT_DIR / "bridge_data"
 SCENE_PATH = BRIDGE_DIR / "closed_loop_scene.npz"
 GRASP_PATH = BRIDGE_DIR / "closed_loop_grasps.npz"
 
-# Source-faithful fallback artifacts:
+# Full-scene fallback artifacts:
 # target crop -> 0 grasps -> workspace-filtered full four-view scene.
 FULL_SCENE_PATH = BRIDGE_DIR / "closed_loop_full_scene.npz"
 FULL_SCENE_RAW_VIEWS_PATH = (
     BRIDGE_DIR / "closed_loop_full_scene_raw_views.npz"
 )
 FULL_GRASP_PATH = BRIDGE_DIR / "closed_loop_full_scene_grasps.npz"
-FULL_TARGET_FILTERED_GRASP_PATH = (
-    BRIDGE_DIR / "closed_loop_full_scene_target_filtered_grasps.npz"
-)
-
 GROUNDING_IMAGE_PATH = BRIDGE_DIR / "perception_rgb.png"
 FULL_PERCEPTION_IMAGE_PATH = BRIDGE_DIR / "topview_full_rgb.png"
 GROUNDING_RESULT_PATH = BRIDGE_DIR / "grounding_result.npz"
-GROUNDING_VIS_PATH = BRIDGE_DIR / "grounding_bbox.png"
 
-# Frozen project-local copy of the original ThinkGrasp VLM system prompt.
-# This avoids a runtime dependency on ../simulation_main.py.
+# Project-local copy of the VLM system prompt.
+# This keeps the runner self-contained at runtime.
 VLM_SYSTEM_PROMPT_PATH = SCRIPT_DIR / "vlm_system_prompt.txt"
 
 # Human-readable closed-loop outputs, grouped by purpose.
@@ -100,8 +98,8 @@ GRASP_DEBUG_PREVIEW_DIR = (
 GRASP_DEBUG_ALL_GRASPS_DIR = (
     GRASP_DEBUG_PREVIEW_DIR / "all_grasps"
 )
-GRASP_DEBUG_TARGET_ASSIGNED_DIR = (
-    GRASP_DEBUG_PREVIEW_DIR / "target_assigned"
+GRASP_DEBUG_TARGET_REGION_DIR = (
+    GRASP_DEBUG_PREVIEW_DIR / "target_region"
 )
 GRASP_DEBUG_SELECTED_GRASP_DIR = (
     GRASP_DEBUG_PREVIEW_DIR / "selected_grasp"
@@ -111,10 +109,11 @@ LOG_OUTPUT_DIR = (
     CLOSED_LOOP_OUTPUT_DIR / "logs"
 )
 
-LEGACY_WORKSPACE_PREVIEW_DIR = (
+# Compatibility output directories retained for cleanup.
+COMPAT_WORKSPACE_PREVIEW_DIR = (
     SCRIPT_DIR / "workspace_preview"
 )
-LEGACY_VIEW_TESTS_DIR = (
+COMPAT_VIEW_TESTS_DIR = (
     SCRIPT_DIR / "view_tests"
 )
 
@@ -128,7 +127,7 @@ if not LEGACY_PERCEPTION_PYTHON:
     raise RuntimeError(
         "LEGACY_PERCEPTION_PYTHON is not set. "
         "Set it to the Python interpreter used for GroundingDINO "
-        "and source-style point-cloud fusion."
+        "and point-cloud fusion."
     )
 
 GROUNDING_PYTHON = Path(
@@ -136,22 +135,29 @@ GROUNDING_PYTHON = Path(
 ).expanduser().resolve()
 GROUNDING_BOX_THRESHOLD = 0.15
 GROUNDING_TEXT_THRESHOLD = 0.25
+# Outer context margin:
+# GraspNet sees this larger region so neighbouring geometry remains
+# available for collision-aware grasp generation.
 GROUNDING_CROP_MARGIN = 20
 
-# VLM and GroundingDINO receive the direct top-view RGB frame.
+# Inner target-grasp margin:
+# only grasps whose centres fall inside the original GroundingDINO bbox
+# plus this small tolerance are eligible for final grasp selection.
+GROUNDING_TARGET_GRASP_MARGIN = 5
+
+# GroundingDINO uses a RAW top-view workspace crop; VLM uses the orthographic heightmap RGB.
 PERCEPTION_WIDTH = 640
 PERCEPTION_HEIGHT = 640
 
-# Full-scene fallback uses the SAME official workspace stored in
-# env.perception_workspace_limits. That workspace is derived once from the
-# fixed purple crop with the Panda-facing X-min edge moved inward by 5 cm.
+# Full-scene fallback uses the runtime perception workspace stored in
+# env.perception_workspace_limits, shared by perception and grasp planning.
 FULL_SCENE_TABLE_HEIGHT_M = 0.855
 FULL_SCENE_TABLE_CLEARANCE_M = 0.003
 FULL_SCENE_MAX_HEIGHT_ABOVE_TABLE_M = 0.30
 
 FULL_SCENE_CAMERAS = (
     ("topview", 640, 640),
-    ("frontview", 640, 480),
+    ("front_oblique_25deg", 640, 480),
     ("left_oblique_25deg", 640, 480),
     ("right_oblique_25deg", 640, 480),
 )
@@ -163,31 +169,41 @@ MIN_WORKSPACE_POINTS = 30
 MAX_ATTEMPTS = 50
 MIN_GRASPED_GRIPPER_WIDTH = 0.005
 
-# Original PyBullet ThinkGrasp grasp-assignment / filtering constants.
-# These mirror utils.graspnet_config in the source implementation.
-PYBULLET_GRASP_OBJECT_DISTANCE_M = 0.05
-PYBULLET_GRASP_ANGLE_DEG = 15.0
-
 # ---------------------------------------------------------------------------
-# Grasp-control integration switch
+# Target-grasp ranking policy:
+# continuous approach-angle quality + VLM preferred-location weighting.
+#
+# This ranking operates only inside the DINO target-region grasp pool.
+# GraspNet confidence remains diagnostic in normal target-grasp mode.
 # ---------------------------------------------------------------------------
-#
-# Keep the old OSC execution path available for immediate rollback.
-#
-# First formal IK integration stage intentionally stops after reaching the
-# real GraspNet-derived pregrasp pose. It does NOT descend, close, lift,
-# place, or enter the old OSC recovery path.
-GRASP_CONTROL_MODE = "ik"  # "ik" or "osc"
-IK_STOP_AFTER_PREGRASP = False
-IK_STOP_AFTER_GRASP_POSE = False
+GRASP_SELECTION_ANGLE_WEIGHT = 0.60
+GRASP_SELECTION_PREFERRED_WEIGHT = 0.40
+GRASP_SELECTION_ANGLE_SIGMA_DEG = 30.0
+GRASP_SELECTION_PREFERRED_SIGMA_M = 0.05
 
+# Full-scene fallback is intentionally target-agnostic.
+# It is used only when the selected target region produces zero usable grasps.
+# The purpose is to execute one mechanically suitable grasp that perturbs
+# the clutter state before the next perception cycle, avoiding repeated failure
+# on an unchanged scene. Preferred-location information is not used here.
+FULL_SCENE_FALLBACK_ANGLE_WEIGHT = 0.60
+FULL_SCENE_FALLBACK_GRASPNET_WEIGHT = 0.40
+
+# DINO bbox soft ranking: DINO confidence + VLM centroid proximity.
+# GroundingDINO remains the primary bbox-ranking signal.
+# VLM centroid is used only as a soft spatial disambiguation cue.
+# Keeping DINO dominant prevents a weak semantic candidate from winning
+# only because it happens to be spatially close to the VLM centroid.
+DINO_RANKING_CONFIDENCE_WEIGHT = 0.70
+DINO_RANKING_CENTROID_WEIGHT = 0.30
+DINO_RANKING_CENTROID_SIGMA_M = 0.08
 
 # q_ref advances at MuJoCo's 500 Hz physics rate. Capture every 50 physics
 # steps = one frame every 0.1 s = 10 real-time frames/s, matching the
 # DualViewRecorder output fps below.
 IK_VIDEO_PHYSICS_CAPTURE_INTERVAL = 50
 
-# PyBullet-style fixed Panda drop posture.
+# Fixed Panda drop posture.
 PANDA_DROP_JOINTS = np.array(
     [
          0.86239812,
@@ -201,9 +217,64 @@ PANDA_DROP_JOINTS = np.array(
     dtype=np.float64,
 )
 
+# ============================================================
+# Case Configuration
+# ============================================================
+
+# One fixed default target per scene.
+#
+# Normal usage:
+#     python run_closed_loop.py --scene 5
+#
+# The runner resolves:
+#     5 -> scene05 -> cases/case_scene05_gaming_mouse.txt
+#
+# --case remains available as an explicit manual override.
+DEFAULT_CASE_BY_SCENE = {
+    "scene01": "case_scene01_white_ramekin.txt",
+    "scene02": "case_scene02_nikon_camera.txt",
+    "scene03": "case_scene03_mario_figure.txt",
+    "scene04": "case_scene04_baby_car.txt",
+    "scene05": "case_scene05_gaming_mouse.txt",
+    "scene06": "case_scene06_moisturizer_jar.txt",
+    "scene07": "case_scene07_rhino_figure.txt",
+    "scene08": "case_scene08_creatine_bottle.txt",
+    "scene09": "case_scene09_lion_figure.txt",
+    "scene10": "case_scene10_crocodile_toy.txt",
+}
+
+
+def _normalize_scene_name(scene_argument):
+    """Accept either 1..10 or scene01..scene10 and return sceneXX."""
+
+    value = str(scene_argument).strip().lower()
+
+    if value.isdigit():
+        scene_number = int(value)
+
+        if not 1 <= scene_number <= 10:
+            raise ValueError(
+                "--scene numeric value must be between 1 and 10, "
+                f"got {scene_argument!r}."
+            )
+
+        value = f"scene{scene_number:02d}"
+
+    if value not in GSO_SCENE_OBJECT_SPECS:
+        raise ValueError(
+            f"Unknown scene {scene_argument!r}. "
+            "Use 1..10 or one of "
+            f"{sorted(GSO_SCENE_OBJECT_SPECS)}."
+        )
+
+    return value
+
 
 def load_case_config():
-    """Load one fixed MuJoCo testcase in the same spirit as PyBullet presets.
+    """Load one fixed MuJoCo testcase.
+
+    Normal use selects only the scene number. The corresponding fixed case
+    is chosen automatically from DEFAULT_CASE_BY_SCENE.
 
     File format:
         line 1: natural-language language goal
@@ -216,36 +287,68 @@ def load_case_config():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Run one fixed ThinkGrasp MuJoCo testcase. "
-            "The testcase stores both the language goal and the simulator "
-            "ground-truth target object."
+            "Run one fixed MuJoCo scene. "
+            "Use --scene 1..10 to automatically load that scene's fixed case. "
+            "Use --case only when an explicit case override is needed."
         )
+    )
+    parser.add_argument(
+        "--scene",
+        type=str,
+        default="1",
+        help=(
+            "Scene number 1..10, or scene01..scene10. "
+            "Default: 1."
+        ),
     )
     parser.add_argument(
         "--case",
         type=str,
-        default=str(DEFAULT_CASE_PATH),
+        default=None,
         help=(
-            "Case file path or case name under ./cases. "
-            "Default: cases/case02_white_ramekin.txt"
+            "Optional manual case override. "
+            "Accepts a case file path or case name under ./cases. "
+            "If omitted, the fixed case for --scene is loaded automatically."
         ),
     )
     args = parser.parse_args()
 
-    requested = Path(args.case)
+    scene_name = _normalize_scene_name(
+        args.scene
+    )
 
-    if not requested.is_absolute():
-        # A bare name such as "case01_red_mug" resolves under ./cases.
-        if requested.parent == Path("."):
-            if requested.suffix == "":
-                requested = requested.with_suffix(".txt")
-            requested = CASE_DIR / requested
-        else:
-            requested = SCRIPT_DIR / requested
+    if args.case is None:
+        default_case_name = DEFAULT_CASE_BY_SCENE.get(
+            scene_name
+        )
+
+        if default_case_name is None:
+            raise KeyError(
+                f"No fixed case is configured for {scene_name!r}."
+            )
+
+        requested = CASE_DIR / default_case_name
+    else:
+        requested = Path(args.case)
+
+        if not requested.is_absolute():
+            # A bare case name resolves under ./cases.
+            if requested.parent == Path("."):
+                if requested.suffix == "":
+                    requested = requested.with_suffix(".txt")
+                requested = CASE_DIR / requested
+            else:
+                requested = SCRIPT_DIR / requested
 
     case_path = requested.resolve()
 
     if not case_path.is_file():
+        if args.case is None:
+            raise FileNotFoundError(
+                "The fixed case configured for "
+                f"{scene_name} does not exist: {case_path}"
+            )
+
         raise FileNotFoundError(
             f"Case file does not exist: {case_path}"
         )
@@ -278,95 +381,93 @@ def load_case_config():
         "case_path": case_path,
         "language_goal": language_goal,
         "target_object": target_object,
+        "scene_name": scene_name,
     }
 
+# ============================================================
+# Perception and Grounding Utilities
+# ============================================================
 
-
-def identify_highest_scene_object(env):
-    """Return the MuJoCo scene object whose body center has the highest Z.
-
-    This intentionally mirrors the original PyBullet ThinkGrasp heuristic:
-    after a successful lift, the highest rigid object is treated as the object
-    currently held by the gripper. This is simulator ground truth and is used
-    only for task-success evaluation, not for perception or grasp generation.
-    """
-
-    object_heights = []
-
-    for object_name, body_id in env.object_body_ids.items():
-        body_id = int(body_id)
-        body_position = np.asarray(
-            env.sim.data.body_xpos[body_id],
-            dtype=np.float64,
-        ).copy()
-
-        object_heights.append(
-            {
-                "name": str(object_name),
-                "body_id": body_id,
-                "position": body_position,
-                "z": float(body_position[2]),
-            }
-        )
-
-    if not object_heights:
-        return {
-            "name": None,
-            "body_id": None,
-            "position": None,
-            "z": None,
-            "all_objects": [],
-        }
-
-    highest = max(
-        object_heights,
-        key=lambda item: item["z"],
-    )
-
-    return {
-        "name": highest["name"],
-        "body_id": highest["body_id"],
-        "position": highest["position"],
-        "z": highest["z"],
-        "all_objects": object_heights,
-    }
-
-
-def preferred_location_to_world_point(
+def image_pixel_to_nearest_valid_world_point(
     topview_data,
-    bbox_xyxy,
-    preferred_location,
+    pixel_xy,
 ):
-    """Convert a 1..9 preferred DINO-bbox cell to one valid world XYZ point.
-
-    Cell numbering follows ThinkGrasp:
-
-        1 2 3
-        4 5 6
-        7 8 9
-
-    Preferred-point policy:
-      1. Try the preferred cell centre pixel.
-      2. If that pixel has no valid world point (including [0, 0, 0]),
-         use the nearest valid pixel inside the same preferred cell.
-      3. If the whole preferred cell is invalid, use the nearest valid pixel
-         inside the complete GroundingDINO bbox.
-
-    This keeps the original preferred-location intent while preventing an
-    invalid default [0, 0, 0] from participating in XY grasp selection.
-    """
-
-    preferred_location = int(preferred_location)
-
-    if not 1 <= preferred_location <= 9:
-        preferred_location = 5
+    """Map one heightmap pixel to a valid world XYZ point."""
 
     pointcloud = np.asarray(
         topview_data["pointcloud"],
         dtype=np.float64,
     )
 
-    if pointcloud.ndim != 3 or pointcloud.shape[2] != 3:
+    height, width = pointcloud.shape[:2]
+
+    pixel_xy = np.asarray(
+        pixel_xy,
+        dtype=np.float64,
+    ).reshape(2)
+
+    px = int(np.clip(round(pixel_xy[0]), 0, width - 1))
+    py = int(np.clip(round(pixel_xy[1]), 0, height - 1))
+
+    valid_mask = (
+        np.isfinite(pointcloud).all(axis=2)
+        & (np.linalg.norm(pointcloud, axis=2) > 1e-9)
+    )
+
+    if valid_mask[py, px]:
+        return {
+            "requested_pixel_xy": np.asarray([px, py], dtype=np.int64),
+            "selected_pixel_xy": np.asarray([px, py], dtype=np.int64),
+            "world_point": pointcloud[py, px].copy(),
+            "fallback_mode": "exact_pixel",
+        }
+
+    ys, xs = np.nonzero(valid_mask)
+    if len(xs) == 0:
+        raise RuntimeError(
+            "Heightmap contains no valid world point for VLM centroid mapping."
+        )
+
+    d2 = (xs - px) ** 2 + (ys - py) ** 2
+    best = int(np.argmin(d2))
+    sx = int(xs[best])
+    sy = int(ys[best])
+
+    return {
+        "requested_pixel_xy": np.asarray([px, py], dtype=np.int64),
+        "selected_pixel_xy": np.asarray([sx, sy], dtype=np.int64),
+        "world_point": pointcloud[sy, sx].copy(),
+        "fallback_mode": "nearest_valid_heightmap_pixel",
+    }
+
+def grounding_bbox_to_target_world_xy(
+    topview_data,
+    bbox_xyxy,
+    pixel_margin=GROUNDING_TARGET_GRASP_MARGIN,
+):
+    """Convert the GroundingDINO target bbox into a world-XY grasp region.
+
+    The original DINO bbox is expanded only by a small target tolerance.
+    This is intentionally separate from GROUNDING_CROP_MARGIN:
+
+      target bbox + small margin:
+          determines which grasp centres belong to the selected target;
+
+      target bbox + large context margin:
+          determines what geometry GraspNet sees.
+
+    No simulator object identity or body centre is used here.
+    """
+
+    pointcloud = np.asarray(
+        topview_data["pointcloud"],
+        dtype=np.float64,
+    )
+
+    if (
+        pointcloud.ndim != 3
+        or pointcloud.shape[2] != 3
+    ):
         raise ValueError(
             "Expected topview pointcloud with shape (H, W, 3), "
             f"got {pointcloud.shape}."
@@ -379,299 +480,178 @@ def preferred_location_to_world_point(
         dtype=np.float64,
     ).reshape(4)
 
-    x1 = float(np.clip(x1, 0, width - 1))
-    x2 = float(np.clip(x2, 0, width - 1))
-    y1 = float(np.clip(y1, 0, height - 1))
-    y2 = float(np.clip(y2, 0, height - 1))
+    margin = int(pixel_margin)
 
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError(
-            f"Invalid GroundingDINO bbox: {bbox_xyxy}"
-        )
-
-    row = (preferred_location - 1) // 3
-    col = (preferred_location - 1) % 3
-
-    cell_x1 = x1 + col * (x2 - x1) / 3.0
-    cell_x2 = x1 + (col + 1) * (x2 - x1) / 3.0
-    cell_y1 = y1 + row * (y2 - y1) / 3.0
-    cell_y2 = y1 + (row + 1) * (y2 - y1) / 3.0
-
-    requested_center_x = int(
+    ix1 = int(
         np.clip(
-            round((cell_x1 + cell_x2) / 2.0),
+            np.floor(x1) - margin,
             0,
             width - 1,
         )
     )
-    requested_center_y = int(
+    iy1 = int(
         np.clip(
-            round((cell_y1 + cell_y2) / 2.0),
+            np.floor(y1) - margin,
             0,
             height - 1,
         )
     )
-
-    def _valid_world_point(point):
-        point = np.asarray(point, dtype=np.float64).reshape(3)
-        return bool(
-            np.isfinite(point).all()
-            and np.linalg.norm(point) > 1e-9
+    ix2 = int(
+        np.clip(
+            np.ceil(x2) + margin,
+            ix1 + 1,
+            width,
         )
-
-    requested_world_point = pointcloud[
-        requested_center_y,
-        requested_center_x,
-    ].copy()
-
-    if _valid_world_point(requested_world_point):
-        return {
-            "preferred_location": preferred_location,
-            "cell_xyxy": np.array(
-                [cell_x1, cell_y1, cell_x2, cell_y2],
-                dtype=np.float64,
-            ),
-            "requested_center_pixel_xy": np.array(
-                [requested_center_x, requested_center_y],
-                dtype=np.int64,
-            ),
-            "center_pixel_xy": np.array(
-                [requested_center_x, requested_center_y],
-                dtype=np.int64,
-            ),
-            "world_point": requested_world_point,
-            "fallback_mode": "cell_center",
-        }
-
-    def _nearest_valid_pixel(search_xyxy):
-        sx1, sy1, sx2, sy2 = np.asarray(
-            search_xyxy,
-            dtype=np.float64,
-        ).reshape(4)
-
-        ix1 = int(np.clip(np.floor(sx1), 0, width - 1))
-        ix2 = int(np.clip(np.ceil(sx2), ix1 + 1, width))
-        iy1 = int(np.clip(np.floor(sy1), 0, height - 1))
-        iy2 = int(np.clip(np.ceil(sy2), iy1 + 1, height))
-
-        region = pointcloud[iy1:iy2, ix1:ix2]
-
-        valid_mask = (
-            np.isfinite(region).all(axis=2)
-            & (np.linalg.norm(region, axis=2) > 1e-9)
+    )
+    iy2 = int(
+        np.clip(
+            np.ceil(y2) + margin,
+            iy1 + 1,
+            height,
         )
-
-        valid_y, valid_x = np.nonzero(valid_mask)
-
-        if len(valid_x) == 0:
-            return None
-
-        global_x = valid_x + ix1
-        global_y = valid_y + iy1
-
-        pixel_dist_sq = (
-            (global_x - requested_center_x) ** 2
-            + (global_y - requested_center_y) ** 2
-        )
-        nearest = int(np.argmin(pixel_dist_sq))
-
-        px = int(global_x[nearest])
-        py = int(global_y[nearest])
-
-        return (
-            np.array([px, py], dtype=np.int64),
-            pointcloud[py, px].copy(),
-        )
-
-    cell_fallback = _nearest_valid_pixel(
-        [cell_x1, cell_y1, cell_x2, cell_y2]
     )
 
-    if cell_fallback is not None:
-        selected_pixel, selected_world_point = cell_fallback
-        fallback_mode = "nearest_valid_in_preferred_cell"
-    else:
-        bbox_fallback = _nearest_valid_pixel(
-            [x1, y1, x2, y2]
+    region = pointcloud[
+        iy1:iy2,
+        ix1:ix2,
+    ]
+
+    valid_mask = (
+        np.isfinite(region).all(axis=2)
+        & (
+            np.linalg.norm(
+                region,
+                axis=2,
+            )
+            > 1e-9
+        )
+    )
+
+    valid_points = region[
+        valid_mask
+    ]
+
+    if len(valid_points) == 0:
+        raise RuntimeError(
+            "GroundingDINO target-grasp region contains "
+            "no valid world points."
         )
 
-        if bbox_fallback is None:
-            raise RuntimeError(
-                "Neither the preferred cell nor the complete GroundingDINO "
-                "bbox contains a valid top-view 3D world point."
-            )
-
-        selected_pixel, selected_world_point = bbox_fallback
-        fallback_mode = "nearest_valid_in_dino_bbox"
+    xy_min = np.min(
+        valid_points[:, :2],
+        axis=0,
+    )
+    xy_max = np.max(
+        valid_points[:, :2],
+        axis=0,
+    )
 
     return {
-        "preferred_location": preferred_location,
-        "cell_xyxy": np.array(
-            [cell_x1, cell_y1, cell_x2, cell_y2],
-            dtype=np.float64,
-        ),
-        "requested_center_pixel_xy": np.array(
-            [requested_center_x, requested_center_y],
+        "pixel_bbox_xyxy": np.asarray(
+            [ix1, iy1, ix2, iy2],
             dtype=np.int64,
         ),
-        "center_pixel_xy": selected_pixel,
-        "world_point": selected_world_point,
-        "fallback_mode": fallback_mode,
+        "world_xy_min": xy_min,
+        "world_xy_max": xy_max,
+        "valid_point_count": int(
+            len(valid_points)
+        ),
     }
 
+# ============================================================
+# Grasp Filtering and Selection
+# ============================================================
 
-
-def assign_grasps_to_objects_pybullet_style(
-    env,
+def filter_grasps_to_dino_target_region(
     grasps,
     scores,
     angles_deg,
-    distance_threshold=PYBULLET_GRASP_OBJECT_DISTANCE_M,
+    target_xy_min,
+    target_xy_max,
 ):
-    """Assign each grasp to its nearest simulator object within 5 cm.
+    """Keep grasps whose centres lie inside the DINO target world-XY region."""
 
-    This restores the original PyBullet ThinkGrasp semantics:
-      - 5 cm assignment identifies which simulator object a grasp belongs to.
-      - Grasps assigned to ANY object are retained.
-      - The fixed testcase GT target is NOT used to pre-filter grasp choices.
-
-    The returned per-grasp object identity is simulator-side bookkeeping for
-    post-transport task evaluation only.
-    """
-
-    grasps = np.asarray(grasps, dtype=np.float64).reshape(-1, 7)
-    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-    angles_deg = np.asarray(angles_deg, dtype=np.float64).reshape(-1)
-
-    if not (
-        len(grasps) == len(scores) == len(angles_deg)
-    ):
-        raise ValueError(
-            "Grasp / score / angle counts do not match: "
-            f"{len(grasps)}, {len(scores)}, {len(angles_deg)}"
-        )
-
-    object_names = []
-    object_body_ids = []
-    object_centres = []
-
-    for object_name, body_id in env.object_body_ids.items():
-        object_names.append(str(object_name))
-        object_body_ids.append(int(body_id))
-        object_centres.append(
-            np.asarray(
-                env.sim.data.body_xpos[int(body_id)],
-                dtype=np.float64,
-            ).copy()
-        )
-
-    if not object_centres:
-        raise RuntimeError(
-            "No simulator objects are available for PyBullet-style "
-            "grasp assignment."
-        )
-
-    object_centres = np.asarray(
-        object_centres,
+    grasps = np.asarray(
+        grasps,
         dtype=np.float64,
-    ).reshape(-1, 3)
-    object_body_ids = np.asarray(
-        object_body_ids,
-        dtype=np.int64,
-    )
+    ).reshape(-1, 7)
 
-    assigned_object_names = np.full(
-        len(grasps),
-        "",
-        dtype=object,
-    )
-    assigned_object_body_ids = np.full(
-        len(grasps),
-        -1,
-        dtype=np.int64,
-    )
-    assigned_object_distances = np.full(
-        len(grasps),
-        np.inf,
+    scores = np.asarray(
+        scores,
         dtype=np.float64,
-    )
+    ).reshape(-1)
+    angles_deg = np.asarray(
+        angles_deg,
+        dtype=np.float64,
+    ).reshape(-1)
 
-    for grasp_index, grasp in enumerate(grasps):
-        distances = np.linalg.norm(
-            object_centres - grasp[:3][None, :],
-            axis=1,
+    target_xy_min = np.asarray(
+        target_xy_min,
+        dtype=np.float64,
+    ).reshape(2)
+
+    target_xy_max = np.asarray(
+        target_xy_max,
+        dtype=np.float64,
+    ).reshape(2)
+
+    if len(grasps) == 0:
+        keep_indices = np.empty(
+            (0,),
+            dtype=np.int64,
+        )
+    else:
+        centres_xy = grasps[:, :2]
+
+        keep_mask = (
+            (centres_xy[:, 0] >= target_xy_min[0])
+            & (centres_xy[:, 0] <= target_xy_max[0])
+            & (centres_xy[:, 1] >= target_xy_min[1])
+            & (centres_xy[:, 1] <= target_xy_max[1])
         )
 
-        within_threshold = np.flatnonzero(
-            distances < float(distance_threshold)
-        )
-
-        if len(within_threshold) == 0:
-            continue
-
-        nearest_local = int(
-            within_threshold[
-                np.argmin(distances[within_threshold])
-            ]
-        )
-
-        assigned_object_names[grasp_index] = (
-            object_names[nearest_local]
-        )
-        assigned_object_body_ids[grasp_index] = int(
-            object_body_ids[nearest_local]
-        )
-        assigned_object_distances[grasp_index] = float(
-            distances[nearest_local]
-        )
-
-    assigned_indices = np.flatnonzero(
-        assigned_object_body_ids >= 0
-    )
+        keep_indices = np.flatnonzero(
+            keep_mask
+        ).astype(np.int64)
 
     return {
-        "grasps": grasps[assigned_indices],
-        "scores": scores[assigned_indices],
-        "angles_deg": angles_deg[assigned_indices],
-        "source_indices": assigned_indices.astype(np.int64),
-        "grasp_object_names": assigned_object_names[assigned_indices],
-        "grasp_object_body_ids": assigned_object_body_ids[assigned_indices],
-        "grasp_object_distances": assigned_object_distances[assigned_indices],
-        "all_assigned_object_names": assigned_object_names,
-        "all_assigned_object_body_ids": assigned_object_body_ids,
-        "all_assigned_object_distances": assigned_object_distances,
-        "object_names": np.asarray(object_names, dtype=object),
-        "object_body_ids": object_body_ids,
-        "object_centres": object_centres,
-        "distance_threshold": float(distance_threshold),
+        "grasps": grasps[keep_indices],
+        "scores": scores[keep_indices],
+        "angles_deg": angles_deg[keep_indices],
+        "source_indices": keep_indices,
     }
 
-
-
-def select_grasp_pybullet_style(
+def select_weighted_grasp(
     grasps,
     scores,
     angles_deg,
-    object_names,
     preferred_world_point,
-    angle_threshold_deg=PYBULLET_GRASP_ANGLE_DEG,
+    fallback_mode=False,
 ):
-    """Mirror the ACTUAL original PyBullet ThinkGrasp grasp-selection flow.
+    """Select one grasp from the complete GroundingDINO target region.
 
-    The original implementation applies the 15-degree preference separately
-    for each simulator object after 5 cm grasp-to-object assignment:
+    Weighted target-grasp policy:
+      1. Start with every grasp already retained inside the DINO target region.
+      2. Convert approach angle to a continuous 0..1 quality score:
+             angle_score = exp(-(angle_deg / sigma_angle)^2)
+      3. Convert preferred-XY distance to a continuous 0..1 score:
+             preferred_score = exp(-(distance_m / sigma_distance)^2)
+      4. Compute:
+             final_score =
+                 0.60 * angle_score
+                 + 0.40 * preferred_score
+      5. Select the grasp with the largest final_score.
 
-      1. Split assigned grasps by simulator object.
-      2. For each object:
-           - if it has one or more grasps with approach angle <= 15 deg,
-             keep only those grasps;
-           - otherwise keep ALL grasps assigned to that object.
-      3. Merge the surviving grasps from all objects.
-      4. Select the surviving grasp nearest in XY to the preferred world
-         point derived from VLM Preferred Grasping Location + DINO bbox.
+    No hard angle threshold is applied.
 
-    The fixed testcase GT target is NOT used to pre-filter this pool.
-    GraspNet score is diagnostic only and does not decide final selection.
+    When ``fallback_mode`` is True, the selector is used for full-scene
+    decluttering rather than target-grasp selection. In that mode the score is:
+        0.60 * angle_score + 0.40 * GraspNet score
+    The VLM preferred-location term is intentionally ignored because fallback
+    only needs one mechanically friendly grasp that changes the scene.
+
+    In normal target-grasp mode, GraspNet score remains diagnostic only.
+
     """
 
     grasps = np.asarray(
@@ -689,11 +669,6 @@ def select_grasp_pybullet_style(
         dtype=np.float64,
     ).reshape(-1)
 
-    object_names = np.asarray(
-        object_names,
-        dtype=object,
-    ).reshape(-1)
-
     preferred_world_point = np.asarray(
         preferred_world_point,
         dtype=np.float64,
@@ -708,12 +683,10 @@ def select_grasp_pybullet_style(
         len(grasps)
         == len(scores)
         == len(angles_deg)
-        == len(object_names)
     ):
         raise ValueError(
-            "Grasp / score / angle / object-name counts do not match: "
-            f"{len(grasps)}, {len(scores)}, "
-            f"{len(angles_deg)}, {len(object_names)}"
+            "Grasp / score / angle counts do not match: "
+            f"{len(grasps)}, {len(scores)}, {len(angles_deg)}"
         )
 
     xy_distances = np.linalg.norm(
@@ -722,189 +695,487 @@ def select_grasp_pybullet_style(
         axis=1,
     )
 
-    # Preserve first-appearance object order for deterministic diagnostics.
-    unique_object_names = []
-    for object_name in object_names:
-        object_name = str(object_name)
-        if object_name not in unique_object_names:
-            unique_object_names.append(object_name)
-
-    surviving_indices = []
-    per_object_angle_filter = []
-
-    for object_name in unique_object_names:
-        object_indices = np.flatnonzero(
-            np.asarray(
-                [
-                    str(name) == object_name
-                    for name in object_names
-                ],
-                dtype=bool,
-            )
-        )
-
-        safe_indices = object_indices[
-            angles_deg[object_indices]
-            <= float(angle_threshold_deg)
-        ]
-
-        if len(safe_indices) > 0:
-            kept_indices = safe_indices
-            mode = "safe_cone_only"
-        else:
-            # Match the historical PyBullet implementation itself:
-            # when this object has no <=15-degree grasp, retain all
-            # grasps belonging to this object.
-            kept_indices = object_indices
-            mode = "all_object_grasps"
-
-        surviving_indices.extend(
-            int(index)
-            for index in kept_indices
-        )
-
-        per_object_angle_filter.append(
-            {
-                "object_name": object_name,
-                "assigned_indices": object_indices.copy(),
-                "safe_indices": safe_indices.copy(),
-                "kept_indices": kept_indices.copy(),
-                "mode": mode,
-            }
-        )
-
-    selection_pool = np.asarray(
-        surviving_indices,
-        dtype=np.int64,
+    angle_scores = np.exp(
+        -(
+            angles_deg
+            / float(GRASP_SELECTION_ANGLE_SIGMA_DEG)
+        ) ** 2
     )
 
-    if len(selection_pool) == 0:
-        raise RuntimeError(
-            "PyBullet-style object-wise angle filtering "
-            "produced an empty selection pool."
+    preferred_scores = np.exp(
+        -(
+            xy_distances
+            / float(GRASP_SELECTION_PREFERRED_SIGMA_M)
+        ) ** 2
+    )
+
+    if fallback_mode:
+        # Full-scene fallback is a simple scene-change action.
+        # Favor mechanically friendly approach angles, while still requiring
+        # reasonable GraspNet confidence. Target preferred location is ignored.
+        final_scores = (
+            float(FULL_SCENE_FALLBACK_ANGLE_WEIGHT)
+            * angle_scores
+            + float(FULL_SCENE_FALLBACK_GRASPNET_WEIGHT)
+            * scores
         )
+        selection_mode = "full_scene_fallback_angle_plus_graspnet"
+        preferred_weight = 0.0
+    else:
+        # Normal target-grasp selection keeps the VLM-guided policy.
+        final_scores = (
+            float(GRASP_SELECTION_ANGLE_WEIGHT)
+            * angle_scores
+            + float(GRASP_SELECTION_PREFERRED_WEIGHT)
+            * preferred_scores
+        )
+        selection_mode = "weighted_angle_preferred"
+        preferred_weight = float(GRASP_SELECTION_PREFERRED_WEIGHT)
 
     selected_index = int(
-        selection_pool[
-            np.argmin(
-                xy_distances[selection_pool]
-            )
-        ]
+        np.argmax(final_scores)
+    )
+
+    all_indices = np.arange(
+        len(grasps),
+        dtype=np.int64,
     )
 
     return {
         "selected_grasp": grasps[selected_index].copy(),
         "selected_index": selected_index,
-        "selected_score": float(
-            scores[selected_index]
+        "selected_score": float(scores[selected_index]),
+        "selected_xy_distance": float(xy_distances[selected_index]),
+        "selected_angle_deg": float(angles_deg[selected_index]),
+
+        # Weighted-ranking diagnostics.
+        "selected_angle_score": float(
+            angle_scores[selected_index]
         ),
-        "selected_xy_distance": float(
-            xy_distances[selected_index]
+        "selected_preferred_score": float(
+            preferred_scores[selected_index]
         ),
-        "selected_angle_deg": float(
-            angles_deg[selected_index]
+        "selected_final_score": float(
+            final_scores[selected_index]
         ),
-        "angle_threshold_deg": float(
-            angle_threshold_deg
+        "angle_weight": float(
+            FULL_SCENE_FALLBACK_ANGLE_WEIGHT
+            if fallback_mode
+            else GRASP_SELECTION_ANGLE_WEIGHT
         ),
-        "per_object_angle_filter": (
-            per_object_angle_filter
+        "preferred_weight": float(
+            preferred_weight
         ),
-        "selection_pool_indices": (
-            selection_pool.copy()
+        "graspnet_weight": float(
+            FULL_SCENE_FALLBACK_GRASPNET_WEIGHT
+            if fallback_mode
+            else 0.0
         ),
-        "selection_pool_xy_distances": (
-            xy_distances[selection_pool].copy()
+        "angle_sigma_deg": float(
+            GRASP_SELECTION_ANGLE_SIGMA_DEG
         ),
-        "selection_pool_scores": (
-            scores[selection_pool].copy()
+        "preferred_sigma_m": float(
+            GRASP_SELECTION_PREFERRED_SIGMA_M
         ),
-        "selection_pool_angles_deg": (
-            angles_deg[selection_pool].copy()
-        ),
-        "selection_pool_object_names": (
-            object_names[selection_pool].copy()
-        ),
+        "all_angle_scores": angle_scores.copy(),
+        "all_preferred_scores": preferred_scores.copy(),
+        "all_final_scores": final_scores.copy(),
+
+        "selection_mode": selection_mode,
+        "selection_pool_indices": all_indices.copy(),
+        "selection_pool_xy_distances": xy_distances.copy(),
+        "selection_pool_scores": scores.copy(),
+        "selection_pool_angles_deg": angles_deg.copy(),
     }
 
-
-def filter_grounding_candidates_to_perception_workspace(
-    boxes,
-    scores,
-    phrases,
-    crop_xyxy=FIXED_PERCEPTION_CROP_XYXY,
+def derive_raw_workspace_crop_from_world(
+    raw_topview_data,
+    workspace_limits,
 ):
-    """Keep GroundingDINO detections whose bbox centre is inside the purple crop.
+    """Derive the RAW-image crop directly from the configured world workspace.
 
-    GroundingDINO still runs on the full 640x640 top-view image, so all bbox
-    coordinates remain in the original image coordinate system. This avoids
-    any crop-coordinate offset in the later 3D / preferred-cell pipeline.
+    No fixed purple/image crop is used.
+
+    We use the RAW top-view per-pixel world pointcloud:
+        RAW pixel -> world XYZ
+
+    A pixel belongs to the image-space workspace iff its world XYZ lies inside
+    env.perception_workspace_limits. The minimal axis-aligned RAW-image bbox
+    covering all such pixels becomes the GroundingDINO input crop.
     """
 
-    boxes = np.asarray(
-        boxes,
+    pointcloud = np.asarray(
+        raw_topview_data["pointcloud"],
         dtype=np.float64,
-    ).reshape(-1, 4)
-    scores = np.asarray(
-        scores,
-        dtype=np.float64,
-    ).reshape(-1)
-    phrases = np.asarray(phrases)
+    )
 
-    if len(boxes) == 0:
-        return {
-            "boxes": boxes,
-            "scores": scores,
-            "phrases": phrases,
-            "keep_mask": np.zeros(0, dtype=bool),
-            "centres_xy": np.zeros((0, 2), dtype=np.float64),
-        }
+    workspace_limits = np.asarray(
+        workspace_limits,
+        dtype=np.float64,
+    )
+
+    if pointcloud.ndim != 3 or pointcloud.shape[2] != 3:
+        raise ValueError(
+            "Expected raw top-view pointcloud with shape (H, W, 3), "
+            f"got {pointcloud.shape}."
+        )
+
+    if workspace_limits.shape != (3, 2):
+        raise ValueError(
+            "workspace_limits must have shape (3, 2), "
+            f"got {workspace_limits.shape}."
+        )
+
+    valid = (
+        np.isfinite(pointcloud).all(axis=2)
+        & (np.linalg.norm(pointcloud, axis=2) > 1e-9)
+        & (pointcloud[..., 0] >= workspace_limits[0, 0])
+        & (pointcloud[..., 0] <= workspace_limits[0, 1])
+        & (pointcloud[..., 1] >= workspace_limits[1, 0])
+        & (pointcloud[..., 1] <= workspace_limits[1, 1])
+        & (pointcloud[..., 2] >= workspace_limits[2, 0])
+        & (pointcloud[..., 2] <= workspace_limits[2, 1])
+    )
+
+    ys, xs = np.nonzero(valid)
+
+    if len(xs) == 0:
+        raise RuntimeError(
+            "No RAW top-view pixels project into the configured world workspace."
+        )
+
+    height, width = pointcloud.shape[:2]
+
+    x1 = int(np.clip(xs.min(), 0, width - 1))
+    y1 = int(np.clip(ys.min(), 0, height - 1))
+    x2 = int(np.clip(xs.max() + 1, x1 + 1, width))
+    y2 = int(np.clip(ys.max() + 1, y1 + 1, height))
+
+    return {
+        "crop_xyxy": np.asarray(
+            [x1, y1, x2, y2],
+            dtype=np.int64,
+        ),
+        "workspace_pixel_count": int(len(xs)),
+        "mask": valid,
+    }
+
+def raw_crop_bbox_to_full_bbox(
+    bbox_xyxy,
+    crop_xyxy,
+):
+    """Translate one GroundingDINO bbox from crop coordinates to full RAW coordinates."""
+
+    bbox = np.asarray(
+        bbox_xyxy,
+        dtype=np.float64,
+    ).reshape(4)
 
     crop = np.asarray(
         crop_xyxy,
         dtype=np.float64,
     ).reshape(4)
-    x1, y1, x2, y2 = crop
 
-    centres_xy = np.column_stack(
+    offset_x = crop[0]
+    offset_y = crop[1]
+
+    return np.asarray(
         [
-            0.5 * (boxes[:, 0] + boxes[:, 2]),
-            0.5 * (boxes[:, 1] + boxes[:, 3]),
-        ]
+            bbox[0] + offset_x,
+            bbox[1] + offset_y,
+            bbox[2] + offset_x,
+            bbox[3] + offset_y,
+        ],
+        dtype=np.float64,
     )
 
-    keep_mask = (
-        (centres_xy[:, 0] >= x1)
-        & (centres_xy[:, 0] <= x2)
-        & (centres_xy[:, 1] >= y1)
-        & (centres_xy[:, 1] <= y2)
+def raw_bbox_to_workspace_world_region(
+    raw_topview_data,
+    bbox_xyxy,
+    workspace_limits,
+):
+    """Convert one full-RAW DINO bbox to a world-XYZ region.
+
+    Only valid points inside the configured world workspace are retained.
+    """
+
+    pointcloud = np.asarray(
+        raw_topview_data["pointcloud"],
+        dtype=np.float64,
     )
+
+    workspace_limits = np.asarray(
+        workspace_limits,
+        dtype=np.float64,
+    )
+
+    height, width = pointcloud.shape[:2]
+
+    x1, y1, x2, y2 = np.asarray(
+        bbox_xyxy,
+        dtype=np.float64,
+    ).reshape(4)
+
+    ix1 = int(np.clip(np.floor(x1), 0, width - 1))
+    iy1 = int(np.clip(np.floor(y1), 0, height - 1))
+    ix2 = int(np.clip(np.ceil(x2), ix1 + 1, width))
+    iy2 = int(np.clip(np.ceil(y2), iy1 + 1, height))
+
+    region = pointcloud[iy1:iy2, ix1:ix2]
+
+    valid = (
+        np.isfinite(region).all(axis=2)
+        & (np.linalg.norm(region, axis=2) > 1e-9)
+        & (region[..., 0] >= workspace_limits[0, 0])
+        & (region[..., 0] <= workspace_limits[0, 1])
+        & (region[..., 1] >= workspace_limits[1, 0])
+        & (region[..., 1] <= workspace_limits[1, 1])
+        & (region[..., 2] >= workspace_limits[2, 0])
+        & (region[..., 2] <= workspace_limits[2, 1])
+    )
+
+    valid_points = region[valid]
+
+    if len(valid_points) == 0:
+        raise RuntimeError(
+            "RAW GroundingDINO bbox contains no valid 3D points inside "
+            "the official world workspace."
+        )
 
     return {
-        "boxes": boxes[keep_mask],
-        "scores": scores[keep_mask],
-        "phrases": phrases[keep_mask],
-        "keep_mask": keep_mask,
-        "centres_xy": centres_xy,
+        "pixel_bbox_xyxy": np.asarray(
+            [ix1, iy1, ix2, iy2],
+            dtype=np.int64,
+        ),
+        "world_xyz_min": np.min(valid_points, axis=0),
+        "world_xyz_max": np.max(valid_points, axis=0),
+        "world_xy_min": np.min(valid_points[:, :2], axis=0),
+        "world_xy_max": np.max(valid_points[:, :2], axis=0),
+        "valid_point_count": int(len(valid_points)),
     }
 
+def world_xy_region_to_heightmap_bbox(
+    topview_data,
+    world_xy_min,
+    world_xy_max,
+):
+    """Register a world-XY rectangle onto the existing heightmap grid."""
 
+    pointcloud = np.asarray(
+        topview_data["pointcloud"],
+        dtype=np.float64,
+    )
 
-def run_source_style_pointcloud_fusion(
+    world_xy_min = np.asarray(
+        world_xy_min,
+        dtype=np.float64,
+    ).reshape(2)
+
+    world_xy_max = np.asarray(
+        world_xy_max,
+        dtype=np.float64,
+    ).reshape(2)
+
+    valid = (
+        np.isfinite(pointcloud).all(axis=2)
+        & (np.linalg.norm(pointcloud, axis=2) > 1e-9)
+        & (pointcloud[..., 0] >= world_xy_min[0])
+        & (pointcloud[..., 0] <= world_xy_max[0])
+        & (pointcloud[..., 1] >= world_xy_min[1])
+        & (pointcloud[..., 1] <= world_xy_max[1])
+    )
+
+    ys, xs = np.nonzero(valid)
+
+    if len(xs) == 0:
+        raise RuntimeError(
+            "RAW DINO world-XY region does not overlap valid heightmap pixels."
+        )
+
+    height, width = pointcloud.shape[:2]
+
+    x1 = int(np.clip(xs.min(), 0, width - 1))
+    y1 = int(np.clip(ys.min(), 0, height - 1))
+    x2 = int(np.clip(xs.max() + 1, x1 + 1, width))
+    y2 = int(np.clip(ys.max() + 1, y1 + 1, height))
+
+    return {
+        "bbox_xyxy": np.asarray(
+            [x1, y1, x2, y2],
+            dtype=np.float64,
+        ),
+        "matching_heightmap_point_count": int(len(xs)),
+    }
+
+def preferred_location_to_world_point_raw(
+    raw_topview_data,
+    bbox_xyxy,
+    preferred_location,
+    workspace_limits,
+):
+    """Map the preferred 3x3 cell of a full-RAW DINO bbox to world XYZ."""
+
+    preferred_location = int(preferred_location)
+    if not 1 <= preferred_location <= 9:
+        preferred_location = 5
+
+    pointcloud = np.asarray(
+        raw_topview_data["pointcloud"],
+        dtype=np.float64,
+    )
+
+    workspace_limits = np.asarray(
+        workspace_limits,
+        dtype=np.float64,
+    )
+
+    height, width = pointcloud.shape[:2]
+
+    x1, y1, x2, y2 = np.asarray(
+        bbox_xyxy,
+        dtype=np.float64,
+    ).reshape(4)
+
+    x1 = float(np.clip(x1, 0, width - 1))
+    x2 = float(np.clip(x2, 0, width - 1))
+    y1 = float(np.clip(y1, 0, height - 1))
+    y2 = float(np.clip(y2, 0, height - 1))
+
+    row = (preferred_location - 1) // 3
+    col = (preferred_location - 1) % 3
+
+    cell_x1 = x1 + col * (x2 - x1) / 3.0
+    cell_x2 = x1 + (col + 1) * (x2 - x1) / 3.0
+    cell_y1 = y1 + row * (y2 - y1) / 3.0
+    cell_y2 = y1 + (row + 1) * (y2 - y1) / 3.0
+
+    req_x = int(np.clip(round((cell_x1 + cell_x2) / 2.0), 0, width - 1))
+    req_y = int(np.clip(round((cell_y1 + cell_y2) / 2.0), 0, height - 1))
+
+    def valid_point(p):
+        p = np.asarray(p, dtype=np.float64).reshape(3)
+        return bool(
+            np.isfinite(p).all()
+            and np.linalg.norm(p) > 1e-9
+            and workspace_limits[0, 0] <= p[0] <= workspace_limits[0, 1]
+            and workspace_limits[1, 0] <= p[1] <= workspace_limits[1, 1]
+            and workspace_limits[2, 0] <= p[2] <= workspace_limits[2, 1]
+        )
+
+    requested_world = pointcloud[req_y, req_x].copy()
+
+    if valid_point(requested_world):
+        return {
+            "preferred_location": preferred_location,
+            "cell_xyxy": np.asarray(
+                [cell_x1, cell_y1, cell_x2, cell_y2],
+                dtype=np.float64,
+            ),
+            "requested_center_pixel_xy": np.asarray(
+                [req_x, req_y],
+                dtype=np.int64,
+            ),
+            "center_pixel_xy": np.asarray(
+                [req_x, req_y],
+                dtype=np.int64,
+            ),
+            "world_point": requested_world,
+            "fallback_mode": "raw_cell_center",
+        }
+
+    def nearest_valid(search_xyxy):
+        sx1, sy1, sx2, sy2 = np.asarray(
+            search_xyxy,
+            dtype=np.float64,
+        ).reshape(4)
+
+        ix1 = int(np.clip(np.floor(sx1), 0, width - 1))
+        iy1 = int(np.clip(np.floor(sy1), 0, height - 1))
+        ix2 = int(np.clip(np.ceil(sx2), ix1 + 1, width))
+        iy2 = int(np.clip(np.ceil(sy2), iy1 + 1, height))
+
+        region = pointcloud[iy1:iy2, ix1:ix2]
+
+        valid = (
+            np.isfinite(region).all(axis=2)
+            & (np.linalg.norm(region, axis=2) > 1e-9)
+            & (region[..., 0] >= workspace_limits[0, 0])
+            & (region[..., 0] <= workspace_limits[0, 1])
+            & (region[..., 1] >= workspace_limits[1, 0])
+            & (region[..., 1] <= workspace_limits[1, 1])
+            & (region[..., 2] >= workspace_limits[2, 0])
+            & (region[..., 2] <= workspace_limits[2, 1])
+        )
+
+        ys, xs = np.nonzero(valid)
+        if len(xs) == 0:
+            return None
+
+        gx = xs + ix1
+        gy = ys + iy1
+
+        d2 = (gx - req_x) ** 2 + (gy - req_y) ** 2
+        best = int(np.argmin(d2))
+
+        px = int(gx[best])
+        py = int(gy[best])
+
+        return (
+            np.asarray([px, py], dtype=np.int64),
+            pointcloud[py, px].copy(),
+        )
+
+    selected = nearest_valid([cell_x1, cell_y1, cell_x2, cell_y2])
+    fallback_mode = "nearest_valid_in_raw_preferred_cell"
+
+    if selected is None:
+        selected = nearest_valid([x1, y1, x2, y2])
+        fallback_mode = "nearest_valid_in_raw_dino_bbox"
+
+    if selected is None:
+        raise RuntimeError(
+            "No valid workspace point exists in preferred RAW DINO region."
+        )
+
+    selected_pixel, selected_world = selected
+
+    return {
+        "preferred_location": preferred_location,
+        "cell_xyxy": np.asarray(
+            [cell_x1, cell_y1, cell_x2, cell_y2],
+            dtype=np.float64,
+        ),
+        "requested_center_pixel_xy": np.asarray(
+            [req_x, req_y],
+            dtype=np.int64,
+        ),
+        "center_pixel_xy": selected_pixel,
+        "world_point": selected_world,
+        "fallback_mode": fallback_mode,
+    }
+
+# ============================================================
+# Full-Scene Fallback and Point-Cloud Fusion
+# ============================================================
+
+def run_pointcloud_fusion(
     raw_views_path,
     output_path,
 ):
-    """Run original ThinkGrasp utils.process_pcds() in the legacy env.
+    """Run the project-local multi-view point-cloud fusion routine.
 
-    The MuJoCo process supplies four already world-frame, workspace-filtered
-    camera clouds. The legacy worker then calls the ORIGINAL PyBullet
-    ThinkGrasp `utils.process_pcds()` and `reconstruction_config` unchanged:
+    The MuJoCo process supplies four world-frame, workspace-filtered camera
+    clouds. The subprocess then applies the reconstruction procedure used by
+    the project-local fusion implementation:
         statistical outlier removal
         -> normal estimation
         -> 1.5 mm voxel downsampling
         -> point-to-plane ICP
         -> merge
         -> voxel downsampling / normal re-estimation
+
+    The same reconstruction strategy is used consistently throughout the
+    current pipeline.
     """
 
     command = [
@@ -916,8 +1187,7 @@ def run_source_style_pointcloud_fusion(
         str(output_path),
     ]
 
-    print("Running source-style ThinkGrasp point-cloud fusion subprocess:")
-    print(" ".join(command))
+    print("Running point-cloud fusion.")
 
     subprocess.run(
         command,
@@ -927,13 +1197,12 @@ def run_source_style_pointcloud_fusion(
 
     if not Path(output_path).is_file():
         raise RuntimeError(
-            "Source-style point-cloud fusion finished without creating "
+            "Point-cloud fusion finished without creating "
             f"the expected output: {output_path}"
         )
 
-
 def _derive_full_scene_workspace_xy_bounds(env):
-    """Return XY bounds from the one official runtime MuJoCo workspace."""
+    """Return XY bounds from the runtime perception workspace."""
 
     workspace_limits = np.asarray(
         env.perception_workspace_limits,
@@ -949,24 +1218,14 @@ def _derive_full_scene_workspace_xy_bounds(env):
     xy_min = workspace_limits[:2, 0].copy()
     xy_max = workspace_limits[:2, 1].copy()
 
-    print(
-        "Full-scene fallback uses official workspace XY min:",
-        xy_min,
-    )
-    print(
-        "Full-scene fallback uses official workspace XY max:",
-        xy_max,
-    )
-
     return xy_min, xy_max
-
 
 def export_workspace_filtered_full_scene(
     env,
     output_path,
     ply_path,
 ):
-    """Export four-view full scene using original ThinkGrasp fusion logic.
+    """Export the four-view full scene using the project-local fusion pipeline.
 
     MuJoCo-specific part:
         capture the four current MuJoCo cameras
@@ -974,10 +1233,10 @@ def export_workspace_filtered_full_scene(
         -> keep the validated official MuJoCo workspace
         -> keep the existing tabletop clearance
 
-    Source-faithful part:
-        each camera cloud is sorted by Z as in get_fuse_pointcloud()
-        -> legacy subprocess calls local source copy process_pcds()
-           with the copied original reconstruction_config unchanged.
+    Fusion stage:
+        each camera cloud is sorted by Z before fusion
+        -> subprocess calls the project-local fusion implementation
+           with the configured reconstruction parameters.
     """
 
     workspace_xy_min, workspace_xy_max = (
@@ -986,28 +1245,26 @@ def export_workspace_filtered_full_scene(
         )
     )
 
-    official_workspace = np.asarray(
+    runtime_workspace = np.asarray(
         env.perception_workspace_limits,
         dtype=np.float64,
     )
 
-    # Preserve the already-validated MuJoCo geometric workspace policy.
-    # The point-cloud FUSION algorithm itself is delegated unchanged to the
-    # original ThinkGrasp source implementation.
+    # Apply the runtime workspace bounds before multi-view point-cloud fusion.
     z_min = max(
-        float(official_workspace[2, 0]),
+        float(runtime_workspace[2, 0]),
         float(FULL_SCENE_TABLE_HEIGHT_M)
         + float(FULL_SCENE_TABLE_CLEARANCE_M),
     )
     z_max = min(
-        float(official_workspace[2, 1]),
+        float(runtime_workspace[2, 1]),
         float(FULL_SCENE_TABLE_HEIGHT_M)
         + float(FULL_SCENE_MAX_HEIGHT_ABOVE_TABLE_M),
     )
 
     if z_min >= z_max:
         raise RuntimeError(
-            "Official workspace Z range is empty after tabletop clearance."
+            "Workspace Z range is empty after tabletop clearance."
         )
 
     raw_view_payload = {}
@@ -1048,8 +1305,7 @@ def export_workspace_filtered_full_scene(
             np.count_nonzero(base_valid)
         )
 
-        # Match original get_fuse_pointcloud() bound convention:
-        # lower bound inclusive, upper bound exclusive.
+        # Use lower-inclusive / upper-exclusive workspace bounds.
         workspace_mask = (
             base_valid
             & (
@@ -1083,12 +1339,11 @@ def export_workspace_filtered_full_scene(
 
         if len(kept_points) == 0:
             raise RuntimeError(
-                "Source-style full-scene fusion received an empty "
+                "Full-scene fusion received an empty "
                 f"workspace cloud from camera {camera_name!r}."
             )
 
-        # Original get_fuse_pointcloud() sorts each camera cloud by Z before
-        # creating the Open3D point cloud.
+        # Sort each camera cloud by Z before fusion.
         z_order = np.argsort(
             kept_points[:, 2]
         )
@@ -1171,7 +1426,7 @@ def export_workspace_filtered_full_scene(
         exist_ok=True,
     )
 
-    run_source_style_pointcloud_fusion(
+    run_pointcloud_fusion(
         raw_views_path=FULL_SCENE_RAW_VIEWS_PATH,
         output_path=output_path,
     )
@@ -1187,16 +1442,16 @@ def export_workspace_filtered_full_scene(
             "colors"
         ].astype(np.float32)
 
-        source_voxel_size = float(
+        fusion_voxel_size = float(
             fused_data["voxel_size"]
         )
-        source_nb_neighbors = int(
+        fusion_nb_neighbors = int(
             fused_data["nb_neighbors"]
         )
-        source_std_ratio = float(
+        fusion_std_ratio = float(
             fused_data["std_ratio"]
         )
-        source_max_correspondence_distance = float(
+        fusion_max_correspondence_distance = float(
             fused_data["max_correspondence_distance"]
         )
 
@@ -1206,56 +1461,10 @@ def export_workspace_filtered_full_scene(
         colors=colors,
     )
 
-    print()
     print(
-        "Source-style full-scene fallback exported."
-    )
-    print(
-        "Full-scene workspace world XY min:",
-        workspace_xy_min,
-    )
-    print(
-        "Full-scene workspace world XY max:",
-        workspace_xy_max,
-    )
-    print(
-        "Full-scene workspace world Z:",
-        [z_min, z_max],
-    )
-    print(
-        "Full-scene per-camera raw points:",
-        per_camera_raw_counts,
-    )
-    print(
-        "Full-scene per-camera kept points:",
-        per_camera_kept_counts,
-    )
-    print(
-        "Original ThinkGrasp fusion config:",
-        {
-            "nb_neighbors": source_nb_neighbors,
-            "std_ratio": source_std_ratio,
-            "voxel_size": source_voxel_size,
-            "max_correspondence_distance": (
-                source_max_correspondence_distance
-            ),
-        },
-    )
-    print(
-        "Full-scene source-fused points:",
-        len(points),
-    )
-    print(
-        "Full-scene filtered XYZ min:",
-        points.min(axis=0),
-    )
-    print(
-        "Full-scene filtered XYZ max:",
-        points.max(axis=0),
-    )
-    print(
-        "Full-scene GraspNet input PLY saved:",
-        ply_path,
+        "Full-scene fusion:",
+        f"{len(points)} points from {len(FULL_SCENE_CAMERAS)} views, "
+        f"voxel={fusion_voxel_size:.4f} m",
     )
 
     return {
@@ -1274,83 +1483,15 @@ def export_workspace_filtered_full_scene(
         "camera_kept_counts": (
             per_camera_kept_counts
         ),
-        "source_voxel_size": source_voxel_size,
+        "fusion_voxel_size": fusion_voxel_size,
     }
-
-
-def filter_full_scene_grasps_to_target_xy(
-    grasps,
-    scores,
-    angles_deg,
-    target_xy_min,
-    target_xy_max,
-):
-    """Keep fallback grasps whose centres lie inside the target XY crop."""
-
-    grasps = np.asarray(
-        grasps,
-        dtype=np.float64,
-    ).reshape(-1, 7)
-    scores = np.asarray(
-        scores,
-        dtype=np.float64,
-    ).reshape(-1)
-    angles_deg = np.asarray(
-        angles_deg,
-        dtype=np.float64,
-    ).reshape(-1)
-
-    target_xy_min = np.asarray(
-        target_xy_min,
-        dtype=np.float64,
-    ).reshape(2)
-    target_xy_max = np.asarray(
-        target_xy_max,
-        dtype=np.float64,
-    ).reshape(2)
-
-    if len(grasps) == 0:
-        keep_indices = np.empty(
-            (0,),
-            dtype=np.int64,
-        )
-    else:
-        centres_xy = grasps[:, :2]
-        keep_mask = (
-            (
-                centres_xy[:, 0]
-                >= target_xy_min[0]
-            )
-            & (
-                centres_xy[:, 0]
-                <= target_xy_max[0]
-            )
-            & (
-                centres_xy[:, 1]
-                >= target_xy_min[1]
-            )
-            & (
-                centres_xy[:, 1]
-                <= target_xy_max[1]
-            )
-        )
-        keep_indices = np.flatnonzero(
-            keep_mask
-        )
-
-    return {
-        "grasps": grasps[keep_indices],
-        "scores": scores[keep_indices],
-        "angles_deg": angles_deg[keep_indices],
-        "source_indices": keep_indices,
-    }
-
 
 def run_groundingdino_detection(
     image,
     text_prompt,
+    visualization_path,
 ):
-    """Run GroundingDINO in the legacy ThinkGrasp environment."""
+    """Run GroundingDINO in the configured perception environment."""
 
     BRIDGE_DIR.mkdir(
         parents=True,
@@ -1371,7 +1512,7 @@ def run_groundingdino_detection(
         "--output",
         str(GROUNDING_RESULT_PATH),
         "--visualization",
-        str(GROUNDING_VIS_PATH),
+        str(visualization_path),
         "--box-threshold",
         str(GROUNDING_BOX_THRESHOLD),
         "--text-threshold",
@@ -1380,8 +1521,7 @@ def run_groundingdino_detection(
         "cuda",
     ]
 
-    print("Running GroundingDINO subprocess:")
-    print(" ".join(command))
+    print("Running GroundingDINO.")
 
     subprocess.run(
         command,
@@ -1427,19 +1567,201 @@ def run_groundingdino_detection(
         "best_phrase": str(phrases[best_index]),
     }
 
+# ============================================================
+# Visualization and Diagnostics
+# ============================================================
 
+def save_combined_grounding_visualization(
+    image,
+    boxes_xyxy,
+    final_bbox_scores,
+    selected_index,
+    preferred_location,
+    preferred_pixel_xy,
+    output_path,
+):
+    """Save one per-attempt GroundingDINO overview image.
 
+    The image contains:
+      - every GroundingDINO candidate bbox with only its final weighted score;
+      - the selected bbox highlighted with a thick blue border + SELECTED;
+      - the selected bbox split into the 3x3 preferred grasp grid;
+      - the preferred cell highlighted;
+      - the preferred world-point source pixel marked.
 
+    All bbox coordinates must be in the same image coordinate system as
+    ``image``.
+    """
 
+    image = np.asarray(image)
 
+    if image.dtype != np.uint8:
+        clipped = np.clip(image, 0, 255)
+        image = clipped.astype(np.uint8)
 
+    pil_image = Image.fromarray(image)
+    draw = ImageDraw.Draw(pil_image)
 
+    try:
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                20,
+            )
+        except Exception:
+            font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    boxes = np.asarray(
+        boxes_xyxy,
+        dtype=np.float64,
+    ).reshape(-1, 4)
+    selected_index = int(selected_index)
+    preferred_location = int(preferred_location)
+
+    # 1) Draw all candidates first.
+    for idx, box in enumerate(boxes):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        is_selected = (idx == selected_index)
+
+        if is_selected:
+            outline = (0, 120, 255)  # blue
+            width = 5
+        else:
+            outline = (255, 0, 0)    # red
+            width = 2
+
+        draw.rectangle(
+            [x1, y1, x2, y2],
+            outline=outline,
+            width=width,
+        )
+
+        # Display only the score that actually controls bbox selection.
+        # final_bbox_score = 0.70 * DINO + 0.30 * centroid proximity.
+        label = f"{float(final_bbox_scores[idx]):.3f}"
+
+        # Keep label inside image as much as possible.
+        label_x = max(0, int(round(x1)))
+        label_y = max(0, int(round(y1)) - 13)
+
+        draw.text(
+            (label_x, label_y),
+            label,
+            fill=outline,
+            font=font,
+            stroke_width=2,
+            stroke_fill=(255, 255, 255),
+        )
+
+    # 2) Overlay 3x3 grid only on selected bbox.
+    x1, y1, x2, y2 = [
+        float(v)
+        for v in boxes[selected_index]
+    ]
+
+    cell_w = (x2 - x1) / 3.0
+    cell_h = (y2 - y1) / 3.0
+
+    grid_color = (0, 220, 255)
+    for split in (1, 2):
+        gx = x1 + split * cell_w
+        gy = y1 + split * cell_h
+
+        draw.line(
+            [(gx, y1), (gx, y2)],
+            fill=grid_color,
+            width=2,
+        )
+        draw.line(
+            [(x1, gy), (x2, gy)],
+            fill=grid_color,
+            width=2,
+        )
+
+    # Number cells 1..9.
+    for cell in range(1, 10):
+        row = (cell - 1) // 3
+        col = (cell - 1) % 3
+
+        cx1 = x1 + col * cell_w
+        cy1 = y1 + row * cell_h
+        cx2 = x1 + (col + 1) * cell_w
+        cy2 = y1 + (row + 1) * cell_h
+
+        center_x = 0.5 * (cx1 + cx2)
+        center_y = 0.5 * (cy1 + cy2)
+
+        if cell == preferred_location:
+            draw.rectangle(
+                [cx1, cy1, cx2, cy2],
+                outline=(255, 215, 0),
+                width=4,
+            )
+
+        # Small dark badge for the cell number.
+        r = 10
+        draw.ellipse(
+            [
+                center_x - r,
+                center_y - r,
+                center_x + r,
+                center_y + r,
+            ],
+            fill=(55, 55, 55),
+        )
+        try:
+            num_bbox = draw.textbbox(
+                (0, 0),
+                str(cell),
+                font=font,
+            )
+            num_w = num_bbox[2] - num_bbox[0]
+            num_h = num_bbox[3] - num_bbox[1]
+        except Exception:
+            num_w, num_h = 8, 12
+
+        draw.text(
+            (center_x - num_w / 2.0, center_y - num_h / 2.0),
+            str(cell),
+            fill=(255, 255, 255),
+            font=font,
+        )
+
+    # 3) Mark preferred source pixel.
+    preferred_pixel_xy = np.asarray(
+        preferred_pixel_xy,
+        dtype=np.float64,
+    ).reshape(2)
+
+    px, py = [
+        float(v)
+        for v in preferred_pixel_xy
+    ]
+
+    r = 8
+    draw.ellipse(
+        [px - r, py - r, px + r, py + r],
+        fill=(255, 80, 80),
+        outline=(255, 255, 255),
+        width=3,
+    )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    pil_image.save(output_path)
+
+    return output_path
 
 def _build_grasp_debug_marker_points(
     env,
     grasp,
 ):
-    """Return world-frame marker points for one ThinkGrasp 7D grasp.
+    """Return world-frame marker points for one 7D grasp.
 
     The visual marker matches the existing selected-grasp diagnostic:
         - two parallel-jaw fingers
@@ -1462,7 +1784,7 @@ def _build_grasp_debug_marker_points(
     )
     rotation = grasp_eef_pose[:3, :3]
 
-    # Current ThinkGrasp convention used throughout this runner:
+    # End-effector convention used throughout this runner:
     # local +Z is the approaching direction.
     opening_axis = rotation[:, 0]
     approach_axis = rotation[:, 2]
@@ -1507,46 +1829,6 @@ def _build_grasp_debug_marker_points(
         ],
         axis=0,
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def _sample_grasp_debug_line_3d(
     start,
@@ -1600,12 +1882,6 @@ def _sample_grasp_debug_line_3d(
         line_points[:, None, :]
         + offsets[None, :, :]
     ).reshape(-1, 3)
-
-
-
-
-
-
 
 def _build_grasp_debug_pointcloud(
     env,
@@ -1759,7 +2035,6 @@ def _build_grasp_debug_pointcloud(
         ),
     )
 
-
 def prepare_full_scene_grasp_debug_background(
     env,
 ):
@@ -1813,7 +2088,6 @@ def prepare_full_scene_grasp_debug_background(
         scene_points,
         scene_colors,
     )
-
 
 def save_grasp_set_debug_ply(
     env,
@@ -1889,25 +2163,7 @@ def save_grasp_set_debug_ply(
         else 0
     )
 
-    print(
-        "Grasp-debug PLY:",
-        exported_path,
-    )
-    print(
-        "  full-scene points:",
-        len(scene_points),
-    )
-    print(
-        "  grasp count:",
-        grasp_count,
-    )
-    print(
-        "  grasp-marker points:",
-        len(grasp_points),
-    )
-
     return exported_path
-
 
 def clear_previous_closed_loop_outputs():
     """Remove outputs from the previous closed-loop run.
@@ -1922,8 +2178,8 @@ def clear_previous_closed_loop_outputs():
         FUSED_CLOUD_PREVIEW_DIR,
         PERCEPTION_VIEW_OUTPUT_DIR,
         GRASP_DEBUG_PREVIEW_DIR,
-        LEGACY_WORKSPACE_PREVIEW_DIR,
-        LEGACY_VIEW_TESTS_DIR,
+        COMPAT_WORKSPACE_PREVIEW_DIR,
+        COMPAT_VIEW_TESTS_DIR,
     )
 
     removable_suffixes = {
@@ -1956,11 +2212,6 @@ def clear_previous_closed_loop_outputs():
         len(removed_paths),
     )
 
-    for path in removed_paths:
-        print("Removed output:", path)
-
-
-
 class _TeeStream:
     """Write the same text to the terminal and one log file."""
 
@@ -1991,7 +2242,6 @@ class _TeeStream:
             "encoding",
             "utf-8",
         )
-
 
 def _run_with_log():
     """Run one closed-loop task while teeing stdout/stderr to a log."""
@@ -2041,7 +2291,6 @@ def _run_with_log():
             sys.stderr.flush()
             sys.stdout = original_stdout
             sys.stderr = original_stderr
-
 
 def summarize_ik_phase_diagnostic(phase_result):
     """Aggregate existing q_ref diagnostics for one IK motion phase.
@@ -2161,47 +2410,38 @@ def summarize_ik_phase_diagnostic(phase_result):
         ),
     }
 
-
+# ============================================================
+# Closed-Loop Task Execution
+# ============================================================
 
 def main():
     case_config = load_case_config()
     vlm_goal = case_config["language_goal"]
     target_object = case_config["target_object"]
+    scene_name = case_config["scene_name"]
 
     clear_previous_closed_loop_outputs()
 
+    print("Scene:", scene_name)
     print("Case file:", case_config["case_path"])
-    print("Fixed language goal:", vlm_goal)
+    print("Language goal:", vlm_goal)
     print("Simulator GT target for final task evaluation only:", target_object)
 
-    if GRASP_CONTROL_MODE == "ik":
-        controller_config = (
-            load_thinkgrasp_joint_position_controller_config()
-        )
-    elif GRASP_CONTROL_MODE == "osc":
-        controller_config = load_composite_controller_config(
-            controller="BASIC"
-        )
-    else:
-        raise ValueError(
-            "GRASP_CONTROL_MODE must be 'ik' or 'osc', got "
-            f"{GRASP_CONTROL_MODE!r}"
-        )
+    controller_config = (
+        load_thinkgrasp_joint_position_controller_config()
+    )
 
-    print("Grasp control mode:", GRASP_CONTROL_MODE)
-
-    if GRASP_CONTROL_MODE == "ik":
-        print(
-            "IK staged integration:",
-            {
-                "stop_after_pregrasp": IK_STOP_AFTER_PREGRASP,
-                "stop_after_grasp_pose": IK_STOP_AFTER_GRASP_POSE,
-            },
-        )
+    print("Grasp control mode: IK + q_ref + JOINT_POSITION")
 
     env = ThinkGraspMinimalEnv(
         controller_configs=controller_config,
         hard_reset=False,
+        scene_name=scene_name,
+    )
+
+    print(
+        "Scene objects:",
+        sorted(env.object_body_ids.keys()),
     )
 
     if target_object not in env.object_body_ids:
@@ -2235,14 +2475,12 @@ def main():
     )
 
     try:
-        # ThinkGraspMinimalEnv construction already performs the initial reset
+        # Environment construction already performs the initial reset
         # and clutter generation. Do not reset again here, otherwise a second
         # valid clutter scene would be generated and replace the first one.
 
-        # 保存初始化后的安全位姿和7个Panda关节角。
-        # 失败恢复时，只有EEF pose和关节构型都回到home附近，
-        # 才允许重新感知。
-        home_eef_pose = env.get_eef_pose().copy()
+        # Save the initial seven Panda joint positions as the home
+        # configuration. Failure recovery returns here before re-perception.
         home_joint_positions = (
             env.get_arm_joint_positions().copy()
         )
@@ -2252,7 +2490,7 @@ def main():
             home_joint_positions,
         )
         print(
-            "Official MuJoCo fixed workspace:",
+            "Perception workspace:",
             env.perception_workspace_limits,
         )
 
@@ -2262,12 +2500,23 @@ def main():
         env.open_gripper(steps=30)
 
         target_completed = False
-        diagnostic_completed = False
-        diagnostic_stop_stage = None
-        ik_failure_stopped_safely = False
-        ik_failure_phase = None
         attempts_started = 0
         ended_no_grasp_after_fallback = False
+
+        episode_reward = 0.0
+
+        max_pos_dist = float(
+            np.sqrt(
+                (
+                    env.perception_workspace_limits[0, 1]
+                    - env.perception_workspace_limits[0, 0]
+                ) ** 2
+                + (
+                    env.perception_workspace_limits[1, 1]
+                    - env.perception_workspace_limits[1, 0]
+                ) ** 2
+            )
+        )
 
         print()
         print("#" * 60)
@@ -2286,12 +2535,18 @@ def main():
             recorder.capture_frame()
             recorder.add_hold(0.5)
 
-            # =====================================================
-            # Source-faithful PyBullet perception path:
-            #   raw top-view RGB-D -> orthographic workspace heightmap
-            #   same heightmap RGB -> VLM / GroundingDINO
-            #   GroundingDINO bbox -> PyBullet-style workspace-grid crop
-            # =====================================================
+            # ------------------------------------------------------------
+            # 1. Perception
+            # ------------------------------------------------------------
+
+            # GroundingDINO perception path:
+            #   raw top-view RGB-D -> derive RAW crop from the runtime world workspace
+            #   -> crop RAW RGB without resizing -> GroundingDINO
+            #   -> crop bbox + offset -> full RAW bbox
+            #   -> raw per-pixel world XYZ -> official world workspace
+            #   -> registered heightmap bbox -> existing GraspNet geometry
+            #
+            # VLM uses the orthographic workspace heightmap.
             perception_camera_name = "topview"
 
             raw_topview_data = env.get_camera_data(
@@ -2320,36 +2575,57 @@ def main():
                 np.asarray(topview_data["color"]),
             )
 
-            print(
-                "GroundingDINO perception representation:",
-                "PyBullet-style orthographic workspace heightmap",
+            # Human-readable diagnostic only. Keep visualization outputs
+            # outside bridge_data so bridge_data contains only files that are
+            # actually exchanged between pipeline stages.
+            PERCEPTION_VIEW_OUTPUT_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
             )
-            print(
-                "3D perception workspace:",
-                env.perception_workspace_limits,
-            )
-            print(
-                "Raw top-view RGB shape:",
-                raw_topview_data["color"].shape,
-            )
-            print(
-                "PyBullet-style heightmap RGB shape:",
-                topview_data["color"].shape,
-            )
-            print(
-                "PyBullet-style heightmap valid workspace points:",
-                topview_data["valid_workspace_point_count"],
+            imageio.imwrite(
+                PERCEPTION_VIEW_OUTPUT_DIR / "raw_topview_rgb.png",
+                np.asarray(raw_topview_data["color"]),
             )
 
-            # =====================================================
+            print(
+                "Perception:",
+                f"RAW={raw_topview_data['color'].shape}, "
+                f"heightmap={topview_data['color'].shape}, "
+                f"valid_points={topview_data['valid_workspace_point_count']}",
+            )
+
+            raw_workspace_crop = derive_raw_workspace_crop_from_world(
+                raw_topview_data=raw_topview_data,
+                workspace_limits=env.perception_workspace_limits,
+            )
+
+            raw_workspace_crop_xyxy = raw_workspace_crop["crop_xyxy"]
+            rx1, ry1, rx2, ry2 = raw_workspace_crop_xyxy
+
+            raw_workspace_rgb = np.asarray(
+                raw_topview_data["color"]
+            )[ry1:ry2, rx1:rx2].copy()
+
+            imageio.imwrite(
+                PERCEPTION_VIEW_OUTPUT_DIR / "raw_workspace_rgb.png",
+                raw_workspace_rgb,
+            )
+
+            print(
+                "RAW workspace crop:",
+                f"bbox={raw_workspace_crop_xyxy.tolist()}, shape={raw_workspace_rgb.shape}",
+            )
+
+            # ------------------------------------------------------------
+            # 2. VLM Target Selection
+            # ------------------------------------------------------------
+
             # VLM selection:
             #   external natural-language goal + same top-view RGB
             #   -> selected object + preferred 3x3 grasp location
-            # =====================================================
 
             print()
             print("Running Qwen3-VL selection.")
-            print("VLM goal:", vlm_goal)
 
             vlm_result = run_vlm_selection(
                 image_path=FULL_PERCEPTION_IMAGE_PATH,
@@ -2360,6 +2636,11 @@ def main():
             vlm_selected_object = str(
                 vlm_result["selected_object"]
             ).strip()
+
+            vlm_selection_reason = (
+                vlm_result.get("selection_reason")
+                or "not provided"
+            )
 
             preferred_grasping_location = int(
                 vlm_result[
@@ -2374,22 +2655,29 @@ def main():
                 dtype=np.float64,
             ).reshape(2)
 
-            print("VLM selected object:", vlm_selected_object)
             print(
-                "VLM selected centroid pixel xy:",
-                vlm_selected_centroid_xy,
+                "VLM:",
+                f"selected={vlm_selected_object!r}, reason={vlm_selection_reason!r}, "
+                f"preferred={preferred_grasping_location}",
             )
 
-            print(
-                "Simulator GT target (NOT sent to VLM/DINO/GraspNet):",
-                target_object,
+            vlm_centroid_world_result = (
+                image_pixel_to_nearest_valid_world_point(
+                    topview_data=topview_data,
+                    pixel_xy=vlm_selected_centroid_xy,
+                )
             )
+            vlm_centroid_world_point = np.asarray(
+                vlm_centroid_world_result["world_point"],
+                dtype=np.float64,
+            ).reshape(3)
+
             print(
-                "Preferred grasping location:",
-                preferred_grasping_location,
+                "VLM centroid:",
+                f"pixel={vlm_centroid_world_result['selected_pixel_xy'].tolist()}, "
+                f"world_xy={np.round(vlm_centroid_world_point[:2], 4).tolist()}, "
+                f"mapping={vlm_centroid_world_result['fallback_mode']}",
             )
-            print("VLM raw output:")
-            print(vlm_result["raw_output"])
 
             VLM_SELECTION_OUTPUT_DIR.mkdir(
                 parents=True,
@@ -2407,12 +2695,13 @@ def main():
                 bbox_xyxy=vlm_result["result"]["cropping_box"],
                 selected_object=vlm_selected_object,
                 preferred_location=preferred_grasping_location,
+                centroid_xy=vlm_selected_centroid_xy,
                 output_path=vlm_viz_path,
             )
-            print(
-                "VLM selection visualization saved:",
-                vlm_viz_path,
-            )
+
+            # ------------------------------------------------------------
+            # 3. GroundingDINO Target Localization
+            # ------------------------------------------------------------
 
             # GroundingDINO receives the object name selected by Qwen.
             # The internal MuJoCo target name is resolved separately above.
@@ -2421,120 +2710,158 @@ def main():
                 .replace("_", " ")
             )
 
-            print(
-                "GroundingDINO prompt (direct from VLM):",
-                grounding_prompt,
+            print("GroundingDINO prompt:", grounding_prompt)
+
+            GROUNDING_GRID_OUTPUT_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            grounding_grid_viz_path = (
+                GROUNDING_GRID_OUTPUT_DIR
+                / (
+                    f"{target_object}_attempt_{attempt:02d}_"
+                    "grounding_grid.png"
+                )
             )
 
+            # GroundingDINO's subprocess visualization is written directly to
+            # the per-attempt diagnostic output path, never to bridge_data.
+            # After candidate selection, this same path is overwritten by the
+            # richer combined candidate + selected + 3x3 visualization.
             grounding_result = run_groundingdino_detection(
-                image=topview_data["color"],
+                image=raw_workspace_rgb,
                 text_prompt=grounding_prompt,
+                visualization_path=grounding_grid_viz_path,
             )
 
             raw_boxes = grounding_result["boxes"]
             raw_scores = grounding_result["scores"]
             raw_phrases = grounding_result["phrases"]
 
-            print(
-                "GroundingDINO raw candidate count:",
-                len(raw_boxes),
-            )
-            print(
-                "GroundingDINO allowed perception crop:",
-                np.array(
-                    [
-                        0,
-                        0,
-                        topview_data["image_width"],
-                        topview_data["image_height"],
-                    ],
-                    dtype=np.int32,
-                ),
-            )
-
-            workspace_filtered = (
-                filter_grounding_candidates_to_perception_workspace(
-                    boxes=raw_boxes,
-                    scores=raw_scores,
-                    phrases=raw_phrases,
-                    crop_xyxy=np.array(
-                        [
-                            0,
-                            0,
-                            topview_data["image_width"],
-                            topview_data["image_height"],
-                        ],
-                        dtype=np.int32,
-                    ),
-                )
-            )
-
+            # DINO bbox coordinates are relative to raw_workspace_rgb.
+            # Convert every candidate back to full 640x640 RAW coordinates.
             if len(raw_boxes) > 0:
-                for raw_index, (
-                    raw_box,
-                    raw_score,
-                    raw_phrase,
-                    raw_center,
-                    keep,
-                ) in enumerate(
-                    zip(
-                        raw_boxes,
-                        raw_scores,
-                        raw_phrases,
-                        workspace_filtered["centres_xy"],
-                        workspace_filtered["keep_mask"],
-                    )
-                ):
-                    print(
-                        "GroundingDINO raw candidate "
-                        f"{raw_index}: phrase={str(raw_phrase)!r}, "
-                        f"score={float(raw_score):.4f}, "
-                        f"bbox={np.asarray(raw_box)}, "
-                        f"center={np.round(raw_center, 2)}, "
-                        f"inside_purple={bool(keep)}"
-                    )
+                full_raw_boxes = np.stack(
+                    [
+                        raw_crop_bbox_to_full_bbox(
+                            bbox_xyxy=box,
+                            crop_xyxy=raw_workspace_crop_xyxy,
+                        )
+                        for box in raw_boxes
+                    ],
+                    axis=0,
+                )
+            else:
+                full_raw_boxes = np.empty(
+                    (0, 4),
+                    dtype=np.float64,
+                )
 
-            boxes = workspace_filtered["boxes"]
-            scores = workspace_filtered["scores"]
-            phrases = workspace_filtered["phrases"]
+            boxes = full_raw_boxes
+            scores = np.asarray(
+                raw_scores,
+                dtype=np.float64,
+            )
+            phrases = np.asarray(
+                raw_phrases,
+            )
 
             print(
-                "GroundingDINO candidates after purple-workspace filter:",
+                "GroundingDINO candidates:",
                 len(boxes),
             )
 
             if len(boxes) == 0:
                 print(
                     "GroundingDINO found no target bbox inside the "
-                    "purple perception workspace. Re-perceiving the scene."
+                    "perception workspace. Re-perceiving the scene."
                 )
                 continue
 
-            # VLM-centroid-guided GroundingDINO disambiguation.
-            # Primary criterion: bbox centre nearest to the VLM-selected
-            # object's centroid. Secondary criterion: higher DINO score.
-            dino_centres_xy = np.column_stack(
-                (
-                    (boxes[:, 0] + boxes[:, 2]) / 2.0,
-                    (boxes[:, 1] + boxes[:, 3]) / 2.0,
-                )
+            # GroundingDINO bbox soft ranking:
+            # DINO confidence is primary evidence; VLM centroid proximity
+            # is auxiliary evidence. Centroid distance is measured in world XY.
+            dino_centroid_distances_m = np.full(
+                len(boxes),
+                np.inf,
+                dtype=np.float64,
+            )
+            dino_centroid_scores = np.zeros(
+                len(boxes),
+                dtype=np.float64,
+            )
+            dino_final_bbox_scores = np.full(
+                len(boxes),
+                -np.inf,
+                dtype=np.float64,
+            )
+            dino_candidate_world_xy_centres = np.full(
+                (len(boxes), 2),
+                np.nan,
+                dtype=np.float64,
             )
 
-            vlm_centroid_distances_px = np.linalg.norm(
-                dino_centres_xy
-                - vlm_selected_centroid_xy[None, :],
-                axis=1,
-            )
+            for bbox_index, full_box in enumerate(boxes):
+                try:
+                    bbox_world_region = (
+                        raw_bbox_to_workspace_world_region(
+                            raw_topview_data=raw_topview_data,
+                            bbox_xyxy=full_box,
+                            workspace_limits=env.perception_workspace_limits,
+                        )
+                    )
 
-            candidate_order = np.lexsort(
-                (
-                    -scores,
-                    vlm_centroid_distances_px,
-                )
+                    bbox_world_xy_center = 0.5 * (
+                        np.asarray(
+                            bbox_world_region["world_xy_min"],
+                            dtype=np.float64,
+                        )
+                        + np.asarray(
+                            bbox_world_region["world_xy_max"],
+                            dtype=np.float64,
+                        )
+                    )
+
+                    centroid_distance_m = float(
+                        np.linalg.norm(
+                            bbox_world_xy_center
+                            - vlm_centroid_world_point[:2]
+                        )
+                    )
+
+                    centroid_score = float(
+                        np.exp(
+                            -(
+                                centroid_distance_m
+                                / float(DINO_RANKING_CENTROID_SIGMA_M)
+                            ) ** 2
+                        )
+                    )
+
+                    final_bbox_score = (
+                        float(DINO_RANKING_CONFIDENCE_WEIGHT)
+                        * float(scores[bbox_index])
+                        + float(DINO_RANKING_CENTROID_WEIGHT)
+                        * centroid_score
+                    )
+
+                    dino_candidate_world_xy_centres[bbox_index] = (
+                        bbox_world_xy_center
+                    )
+                    dino_centroid_distances_m[bbox_index] = centroid_distance_m
+                    dino_centroid_scores[bbox_index] = centroid_score
+                    dino_final_bbox_scores[bbox_index] = final_bbox_score
+                except RuntimeError:
+                    pass
+
+            candidate_order = np.argsort(
+                -dino_final_bbox_scores,
             )
 
             print(
-                "VLM-centroid-guided GroundingDINO candidate ranking:"
+                "DINO ranking "
+                f"(confidence={DINO_RANKING_CONFIDENCE_WEIGHT:.2f}, "
+                f"centroid={DINO_RANKING_CENTROID_WEIGHT:.2f}):"
             )
 
             for rank, ranked_index in enumerate(
@@ -2542,18 +2869,31 @@ def main():
                 start=1,
             ):
                 ranked_index = int(ranked_index)
+
+                full_box = boxes[ranked_index]
+                full_center = np.asarray(
+                    [
+                        0.5 * (full_box[0] + full_box[2]),
+                        0.5 * (full_box[1] + full_box[3]),
+                    ],
+                    dtype=np.float64,
+                )
+
                 print(
                     f"  rank {rank}: "
                     f"index={ranked_index}, "
-                    f"center="
-                    f"{np.round(dino_centres_xy[ranked_index], 2)}, "
-                    f"distance_px="
-                    f"{vlm_centroid_distances_px[ranked_index]:.2f}, "
-                    f"score={float(scores[ranked_index]):.4f}"
+                    f"phrase={str(phrases[ranked_index]).strip()!r}, "
+                    f"full_raw_center={np.round(full_center, 2)}, "
+                    f"dino_score={float(scores[ranked_index]):.4f}, "
+                    f"bbox_world_xy={np.round(dino_candidate_world_xy_centres[ranked_index], 4)}, "
+                    f"centroid_distance_m={float(dino_centroid_distances_m[ranked_index]):.4f}, "
+                    f"centroid_score={float(dino_centroid_scores[ranked_index]):.4f}, "
+                    f"final_bbox_score={float(dino_final_bbox_scores[ranked_index]):.4f}"
                 )
 
             selected_candidate_index = None
             selected_scene_result = None
+            selected_heightmap_box = None
 
             for candidate_rank, candidate_index in enumerate(
                 candidate_order,
@@ -2568,21 +2908,33 @@ def main():
                     phrases[candidate_index]
                 )
 
-                print()
                 print(
-                    f"Checking GroundingDINO candidate "
-                    f"{candidate_rank}/{len(candidate_order)}"
+                    f"Checking DINO candidate {candidate_rank}/{len(candidate_order)}: "
+                    f"phrase={candidate_phrase!r}, score={candidate_score:.4f}"
                 )
-                print("Candidate phrase:", candidate_phrase)
-                print("Candidate score:", candidate_score)
-                print("Candidate bbox xyxy:", candidate_box)
 
                 try:
+                    raw_world_region = raw_bbox_to_workspace_world_region(
+                        raw_topview_data=raw_topview_data,
+                        bbox_xyxy=candidate_box,
+                        workspace_limits=env.perception_workspace_limits,
+                    )
+
+                    registered_heightmap = world_xy_region_to_heightmap_bbox(
+                        topview_data=topview_data,
+                        world_xy_min=raw_world_region["world_xy_min"],
+                        world_xy_max=raw_world_region["world_xy_max"],
+                    )
+
+                    candidate_heightmap_box = (
+                        registered_heightmap["bbox_xyxy"]
+                    )
+
                     candidate_scene_result = (
                         export_pybullet_style_target_scene(
                             output_path=SCENE_PATH,
                             heightmap_data=topview_data,
-                            bbox_xyxy=candidate_box,
+                            bbox_xyxy=candidate_heightmap_box,
                             workspace_limits=(
                                 env.perception_workspace_limits
                             ),
@@ -2602,35 +2954,6 @@ def main():
                     ]
                 )
 
-                print(
-                    "PyBullet-style expanded bbox xyxy:",
-                    candidate_scene_result[
-                        "expanded_bbox_xyxy"
-                    ],
-                )
-                print(
-                    "Positive heightmap pixels inside bbox:",
-                    candidate_scene_result[
-                        "positive_bbox_pixel_count"
-                    ],
-                )
-                print(
-                    "PyBullet-style full workspace-grid points:",
-                    target_point_count,
-                )
-                print(
-                    "Measured bbox XYZ min:",
-                    candidate_scene_result[
-                        "measured_xyz_min"
-                    ],
-                )
-                print(
-                    "Measured bbox XYZ max:",
-                    candidate_scene_result[
-                        "measured_xyz_max"
-                    ],
-                )
-
                 if (
                     candidate_scene_result[
                         "positive_bbox_pixel_count"
@@ -2647,47 +2970,70 @@ def main():
                 selected_scene_result = (
                     candidate_scene_result
                 )
+                selected_heightmap_box = (
+                    candidate_heightmap_box
+                )
 
                 print(
-                    "Candidate accepted by PyBullet-style "
-                    "heightmap target-crop filter."
+                    "Candidate accepted:",
+                    f"workspace_points={target_point_count}, "
+                    f"positive_pixels={candidate_scene_result['positive_bbox_pixel_count']}",
                 )
                 break
 
             if selected_candidate_index is None:
                 print(
                     "No GroundingDINO candidate produced a valid "
-                    "PyBullet-style target crop. Re-perceiving."
+                    "target crop. Re-perceiving."
                 )
                 continue
 
             scene_result = selected_scene_result
             selected_box = boxes[selected_candidate_index]
 
-            print()
+            # -----------------------------------------------------
+            # Two-layer GroundingDINO region policy.
+            #
+            # Outer region:
+            #   selected_box + GROUNDING_CROP_MARGIN
+            #   -> GraspNet context / collision geometry.
+            #
+            # Inner region:
+            #   selected_box + GROUNDING_TARGET_GRASP_MARGIN
+            #   -> final grasp-centre eligibility.
+            # -----------------------------------------------------
+            target_grasp_region = (
+                grounding_bbox_to_target_world_xy(
+                    topview_data=topview_data,
+                    bbox_xyxy=selected_heightmap_box,
+                    pixel_margin=(
+                        GROUNDING_TARGET_GRASP_MARGIN
+                    ),
+                )
+            )
+
             print(
-                "Selected GroundingDINO phrase:",
-                str(phrases[selected_candidate_index]),
+                "Selected DINO candidate:",
+                f"index={selected_candidate_index}, "
+                f"phrase={str(phrases[selected_candidate_index]).strip()!r}, "
+                f"dino={float(scores[selected_candidate_index]):.4f}, "
+                f"centroid_dist={float(dino_centroid_distances_m[selected_candidate_index]):.4f} m, "
+                f"final={float(dino_final_bbox_scores[selected_candidate_index]):.4f}",
             )
             print(
-                "Selected GroundingDINO score:",
-                float(scores[selected_candidate_index]),
-            )
-            print(
-                "Selected GroundingDINO bbox xyxy:",
-                selected_box,
-            )
-            print(
-                "Exported PyBullet-style workspace-grid points:",
-                scene_result["point_count"],
+                "Target region:",
+                f"{target_grasp_region['valid_point_count']} valid points",
             )
 
             preferred_point_result = (
-                preferred_location_to_world_point(
-                    topview_data=topview_data,
+                preferred_location_to_world_point_raw(
+                    raw_topview_data=raw_topview_data,
                     bbox_xyxy=selected_box,
                     preferred_location=(
                         preferred_grasping_location
+                    ),
+                    workspace_limits=(
+                        env.perception_workspace_limits
                     ),
                 )
             )
@@ -2698,70 +3044,39 @@ def main():
                 ]
             )
 
-            print()
             print(
-                "Preferred grasping cell:",
-                preferred_point_result[
-                    "preferred_location"
-                ],
-            )
-            print(
-                "Preferred cell xyxy:",
-                preferred_point_result[
-                    "cell_xyxy"
-                ],
-            )
-            print(
-                "Preferred requested cell-center pixel xy:",
-                preferred_point_result[
-                    "requested_center_pixel_xy"
-                ],
-            )
-            print(
-                "Preferred selected valid pixel xy:",
-                preferred_point_result[
-                    "center_pixel_xy"
-                ],
-            )
-            print(
-                "Preferred-point fallback mode:",
-                preferred_point_result[
-                    "fallback_mode"
-                ],
-            )
-            print(
-                "Preferred world point xyz:",
-                preferred_world_point,
+                "Preferred grasp point:",
+                f"cell={preferred_point_result['preferred_location']}, "
+                f"world_xy={np.round(preferred_world_point[:2], 4).tolist()}, "
+                f"mapping={preferred_point_result['fallback_mode']}",
             )
 
-            GROUNDING_GRID_OUTPUT_DIR.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-            grounding_grid_viz_path = (
-                GROUNDING_GRID_OUTPUT_DIR
-                / (
-                    f"{target_object}_attempt_{attempt}_"
-                    "grounding_grid.png"
+            preferred_pixel_xy_crop = (
+                np.asarray(
+                    preferred_point_result[
+                        "center_pixel_xy"
+                    ],
+                    dtype=np.int64,
+                )
+                - np.asarray(
+                    raw_workspace_crop_xyxy[:2],
+                    dtype=np.int64,
                 )
             )
-            save_grounding_grid_visualization(
-                image=topview_data["color"],
-                bbox_xyxy=selected_box,
+
+            save_combined_grounding_visualization(
+                image=raw_workspace_rgb,
+                boxes_xyxy=raw_boxes,
+                final_bbox_scores=dino_final_bbox_scores,
+                selected_index=selected_candidate_index,
                 preferred_location=preferred_grasping_location,
-                center_pixel_xy=preferred_point_result[
-                    "center_pixel_xy"
-                ],
+                preferred_pixel_xy=preferred_pixel_xy_crop,
                 output_path=grounding_grid_viz_path,
-            )
-            print(
-                "Grounding 3x3 visualization saved:",
-                grounding_grid_viz_path,
             )
 
             # Diagnostic RGB snapshots. The saved topview image is the
-            # orthographic heightmap actually used by VLM / DINO / target
-            # crop planning; the other images remain raw camera views.
+            # orthographic heightmap used by VLM and target-crop planning;
+            # GroundingDINO uses the RAW workspace crop.
             PERCEPTION_VIEW_OUTPUT_DIR.mkdir(
                 parents=True,
                 exist_ok=True,
@@ -2769,7 +3084,7 @@ def main():
 
             perception_view_configs = (
                 ("topview", 640, 640),
-                ("frontview", 640, 480),
+                ("front_oblique_25deg", 640, 480),
                 ("left_oblique_25deg", 640, 480),
                 ("right_oblique_25deg", 640, 480),
             )
@@ -2800,11 +3115,10 @@ def main():
                     diagnostic_camera_data["color"]
                 ).copy()
 
-                # robosuite's built-in frontview is vertically inverted
-                # relative to the human-readable image convention used by
-                # the custom top / symmetric oblique cameras.
+                # Keep the existing flip only for the custom left oblique
+                # camera, whose saved image convention remains vertically
+                # inverted relative to the other diagnostic views.
                 if diagnostic_camera_name in (
-                    "frontview",
                     "left_oblique_25deg",
                 ):
                     diagnostic_image = np.flipud(
@@ -2814,11 +3128,6 @@ def main():
                 imageio.imwrite(
                     diagnostic_image_path,
                     diagnostic_image,
-                )
-
-                print(
-                    "Perception view saved:",
-                    diagnostic_image_path,
                 )
 
             # Export exactly the points and colors stored in the
@@ -2845,10 +3154,9 @@ def main():
                     )
                 )
 
-            print(
-                "GraspNet input PLY saved:",
-                exported_ply_path,
-            )
+            # ------------------------------------------------------------
+            # 4. Grasp Generation and Selection
+            # ------------------------------------------------------------
 
             run_graspnet_inference(
                 input_path=SCENE_PATH,
@@ -2871,93 +3179,75 @@ def main():
                 dtype=np.float64,
             ).reshape(-1, 7).copy()
 
-            crop_assigned = (
-                assign_grasps_to_objects_pybullet_style(
-                    env=env,
+            # Keep the expanded DINO crop as GraspNet context, but only
+            # allow grasp centres inside the smaller DINO target region to
+            # participate in final selection.
+            target_region_filtered = (
+                filter_grasps_to_dino_target_region(
                     grasps=grasp_data["grasps"],
                     scores=grasp_data["scores"],
                     angles_deg=grasp_data["angles_deg"],
+                    target_xy_min=(
+                        target_grasp_region[
+                            "world_xy_min"
+                        ]
+                    ),
+                    target_xy_max=(
+                        target_grasp_region[
+                            "world_xy_max"
+                        ]
+                    ),
                 )
             )
 
-            candidate_grasps = crop_assigned["grasps"]
-            candidate_scores = crop_assigned["scores"]
-            candidate_angles = crop_assigned["angles_deg"]
-            candidate_object_names = (
-                crop_assigned["grasp_object_names"]
-            )
-            candidate_object_body_ids = (
-                crop_assigned["grasp_object_body_ids"]
-            )
-            candidate_object_distances = (
-                crop_assigned["grasp_object_distances"]
-            )
-
             print(
-                "PyBullet-style object-assignment distance threshold:",
-                crop_assigned["distance_threshold"],
-            )
-            print(
-                "Target-crop grasps assigned to ANY simulator object:",
-                len(candidate_grasps),
+                "GraspNet:",
+                f"collision_filtered={len(grasp_data['grasps'])}, "
+                f"target_region={len(target_region_filtered['grasps'])}",
             )
 
-            assigned_object_summary = {}
-            for assigned_name in candidate_object_names:
-                assigned_name = str(assigned_name)
-                assigned_object_summary[assigned_name] = (
-                    assigned_object_summary.get(assigned_name, 0) + 1
-                )
-
-            print(
-                "Target-crop assigned-grasp counts by object:",
-                assigned_object_summary,
-            )
-
-            # Diagnostic only: retain the fixed GT target-distance printout,
-            # but it no longer filters the grasp-selection pool.
-            target_gt_center = np.asarray(
-                env.sim.data.body_xpos[target_body_id],
-                dtype=np.float64,
-            ).copy()
-
-            all_crop_grasps = np.asarray(
-                grasp_data["grasps"],
+            # The DINO target region defines the final target-grasp
+            # candidate pool. Nearest-object assignment is not used.
+            candidate_grasps = np.asarray(
+                target_region_filtered["grasps"],
                 dtype=np.float64,
             ).reshape(-1, 7)
-
-            crop_gt_distances = np.linalg.norm(
-                all_crop_grasps[:, :3]
-                - target_gt_center[None, :],
-                axis=1,
-            )
-
-            print()
-            print("GT-ASSIGNMENT DIAGNOSTIC — TARGET CROP")
-            print("Target GT body center xyz:", target_gt_center)
-
-            if len(crop_gt_distances) > 0:
-                crop_distance_order = np.argsort(crop_gt_distances)
-
-                print(
-                    "Nearest target-crop grasp distance to GT center [m]:",
-                    float(crop_gt_distances[crop_distance_order[0]]),
-                )
-                print(
-                    "Target-crop grasps within 5 cm of GT center:",
-                    int(np.count_nonzero(
-                        crop_gt_distances
-                        < PYBULLET_GRASP_OBJECT_DISTANCE_M
-                    )),
-                )
+            candidate_scores = np.asarray(
+                target_region_filtered["scores"],
+                dtype=np.float64,
+            ).reshape(-1)
+            candidate_angles = np.asarray(
+                target_region_filtered["angles_deg"],
+                dtype=np.float64,
+            ).reshape(-1)
 
             used_full_scene_fallback = False
 
             if len(candidate_grasps) == 0:
                 print()
                 print(
-                    "Target crop produced 0 object-assigned grasps. "
-                    "Running source-style full-scene fallback."
+                    "Target region produced 0 usable grasps. "
+                    "Running full-scene fallback."
+                )
+
+                # Diagnostic archive only:
+                # preserve the exact full-scene fused point cloud used by
+                # this fallback attempt. This does not recompute or modify
+                # the fallback point cloud.
+                fallback_fused_cloud_ply_path = (
+                    FUSED_CLOUD_PREVIEW_DIR
+                    / (
+                        f"{target_object}_attempt_{attempt}_"
+                        "full_scene_fallback.ply"
+                    )
+                )
+
+                fallback_exported_ply_path = (
+                    export_colored_pointcloud_ply(
+                        output_path=fallback_fused_cloud_ply_path,
+                        points=full_scene_debug_points,
+                        colors=full_scene_debug_colors,
+                    )
                 )
 
                 run_graspnet_inference(
@@ -2982,42 +3272,31 @@ def main():
                     dtype=np.float64,
                 ).reshape(-1, 7).copy()
 
-                fallback_assigned = (
-                    assign_grasps_to_objects_pybullet_style(
-                        env=env,
-                        grasps=full_grasp_data["grasps"],
-                        scores=full_grasp_data["scores"],
-                        angles_deg=full_grasp_data["angles_deg"],
-                    )
-                )
-
-                candidate_grasps = fallback_assigned["grasps"]
-                candidate_scores = fallback_assigned["scores"]
-                candidate_angles = fallback_assigned["angles_deg"]
-                candidate_object_names = (
-                    fallback_assigned["grasp_object_names"]
-                )
-                candidate_object_body_ids = (
-                    fallback_assigned["grasp_object_body_ids"]
-                )
-                candidate_object_distances = (
-                    fallback_assigned["grasp_object_distances"]
-                )
+                candidate_grasps = np.asarray(
+                    full_grasp_data["grasps"],
+                    dtype=np.float64,
+                ).reshape(-1, 7)
+                candidate_scores = np.asarray(
+                    full_grasp_data["scores"],
+                    dtype=np.float64,
+                ).reshape(-1)
+                candidate_angles = np.asarray(
+                    full_grasp_data["angles_deg"],
+                    dtype=np.float64,
+                ).reshape(-1)
 
                 print(
-                    "Full-scene grasps assigned to ANY simulator object:",
+                    "Usable full-scene fallback grasps:",
                     len(candidate_grasps),
                 )
 
                 if len(candidate_grasps) == 0:
                     print(
-                        "Full-scene fallback produced no grasp assigned "
-                        "to any simulator object by the original PyBullet "
-                        "5 cm nearest-object rule."
+                        "Full-scene fallback produced no usable grasp."
                     )
                     print(
-                        "PyBullet-style behavior: ending this case instead "
-                        "of re-perceiving an unchanged scene."
+                        "Ending this case instead of re-perceiving an "
+                        "unchanged scene."
                     )
                     ended_no_grasp_after_fallback = True
                     break
@@ -3025,8 +3304,7 @@ def main():
                 used_full_scene_fallback = True
 
                 print(
-                    "Using all PyBullet-assigned full-scene grasps "
-                    "for final preferred-location selection."
+                    "Using full-scene fallback grasps for final selection."
                 )
 
             all_grasps_ply_path = (
@@ -3043,175 +3321,86 @@ def main():
                 )
             )
 
-            target_assigned_ply_path = (
+            target_region_ply_path = (
                 save_grasp_set_debug_ply(
                     env=env,
                     grasps=candidate_grasps,
                     scene_points=full_scene_debug_points,
                     scene_colors=full_scene_debug_colors,
-                    output_dir=GRASP_DEBUG_TARGET_ASSIGNED_DIR,
+                    output_dir=GRASP_DEBUG_TARGET_REGION_DIR,
                     output_name=(
                         f"{target_object}_attempt_{attempt}_"
-                        "target_assigned.ply"
+                        "target_region.ply"
                     ),
                 )
             )
 
-            print(
-                "All grasps full-scene PLY saved:",
-                all_grasps_ply_path,
-            )
-            print(
-                "Target-assigned full-scene PLY saved:",
-                target_assigned_ply_path,
-            )
-
-            # Diagnostic only: show every object-assigned grasp before
-            # source-faithful 15-degree / preferred-XY selection.
+            # Diagnostic only: show every grasp retained inside the DINO target
+            # region before the final weighted angle / preferred-XY ranking.
             all_candidate_xy_distances = np.linalg.norm(
                 candidate_grasps[:, :2]
                 - preferred_world_point[None, :2],
                 axis=1,
             )
 
-            print()
-            print("All PyBullet-assigned grasps before final selection:")
-            print(
-                "index | object | score | xy_distance_m | approach_angle_deg"
+            all_candidate_angle_scores = np.exp(
+                -(
+                    candidate_angles
+                    / float(GRASP_SELECTION_ANGLE_SIGMA_DEG)
+                ) ** 2
             )
-            for candidate_index in range(len(candidate_grasps)):
-                print(
-                    f"{candidate_index:5d} | "
-                    f"{str(candidate_object_names[candidate_index]):18s} | "
-                    f"{float(candidate_scores[candidate_index]):.6f} | "
-                    f"{float(all_candidate_xy_distances[candidate_index]):.6f} | "
-                    f"{float(candidate_angles[candidate_index]):.3f}"
+
+            all_candidate_preferred_scores = np.exp(
+                -(
+                    all_candidate_xy_distances
+                    / float(GRASP_SELECTION_PREFERRED_SIGMA_M)
+                ) ** 2
+            )
+
+            if used_full_scene_fallback:
+                # Fallback candidates are ranked for scene perturbation, not for
+                # target preferred-location fidelity.
+                all_candidate_final_scores = (
+                    float(FULL_SCENE_FALLBACK_ANGLE_WEIGHT)
+                    * all_candidate_angle_scores
+                    + float(FULL_SCENE_FALLBACK_GRASPNET_WEIGHT)
+                    * candidate_scores
+                )
+            else:
+                all_candidate_final_scores = (
+                    float(GRASP_SELECTION_ANGLE_WEIGHT)
+                    * all_candidate_angle_scores
+                    + float(GRASP_SELECTION_PREFERRED_WEIGHT)
+                    * all_candidate_preferred_scores
                 )
 
             print(
-                "Grasp source for final selection:",
-                (
-                    "source-style four-view ICP full-scene fallback"
-                    if used_full_scene_fallback
-                    else "PyBullet-style heightmap target crop"
-                ),
+                "Grasp source:",
+                "full-scene fallback" if used_full_scene_fallback else "target crop",
             )
 
-            print()
-            print(
-                "Source-style execution policy: selecting exactly one grasp "
-                "for this perception cycle."
-            )
-            print(
-                "The fixed testcase GT target does NOT pre-filter this pool."
-            )
-
-            selection = select_grasp_pybullet_style(
+            selection = select_weighted_grasp(
                 grasps=candidate_grasps,
                 scores=candidate_scores,
                 angles_deg=candidate_angles,
-                object_names=candidate_object_names,
                 preferred_world_point=(
                     preferred_world_point
                 ),
-                angle_threshold_deg=(
-                    PYBULLET_GRASP_ANGLE_DEG
-                ),
+                fallback_mode=used_full_scene_fallback,
             )
 
             selected_grasp = selection[
                 "selected_grasp"
             ]
 
-            print()
-            print(
-                "PyBullet angle threshold degrees:",
-                selection["angle_threshold_deg"],
-            )
-            print(
-                "PyBullet ACTUAL object-wise angle filtering:"
-            )
-            for object_filter in selection[
-                "per_object_angle_filter"
-            ]:
-                print(
-                    "  object="
-                    f"{object_filter['object_name']}, "
-                    "assigned_indices="
-                    f"{object_filter['assigned_indices'].tolist()}, "
-                    "safe_indices="
-                    f"{object_filter['safe_indices'].tolist()}, "
-                    "kept_indices="
-                    f"{object_filter['kept_indices'].tolist()}, "
-                    "mode="
-                    f"{object_filter['mode']}"
-                )
-            print(
-                "Merged selection-pool indices:",
-                selection["selection_pool_indices"],
-            )
-            print(
-                "Merged selection-pool object names:",
-                selection["selection_pool_object_names"],
-            )
-            print(
-                "Selection-pool XY distances:",
-                selection["selection_pool_xy_distances"],
-            )
-            print(
-                "Selection-pool scores (diagnostic only):",
-                selection["selection_pool_scores"],
-            )
-            print(
-                "Selection-pool angles degrees:",
-                selection["selection_pool_angles_deg"],
-            )
-            selected_grasp_index = int(
-                selection["selected_index"]
-            )
-
-            selected_assigned_object_name = str(
-                candidate_object_names[selected_grasp_index]
-            )
-            selected_assigned_object_body_id = int(
-                candidate_object_body_ids[selected_grasp_index]
-            )
-            selected_assigned_object_distance = float(
-                candidate_object_distances[selected_grasp_index]
-            )
-
-            print(
-                "Selected grasp assigned simulator object:",
-                selected_assigned_object_name,
-            )
-            print(
-                "Selected grasp assigned simulator body id:",
-                selected_assigned_object_body_id,
-            )
-            print(
-                "Selected grasp assignment distance [m]:",
-                selected_assigned_object_distance,
-            )
-
-            print(
-                "Selected grasp candidate index:",
-                selected_grasp_index,
-            )
-            print(
-                "Selected grasp score:",
-                selection[
-                    "selected_score"
-                ],
-            )
-            print(
-                "Selected grasp XY distance:",
-                selection[
-                    "selected_xy_distance"
-                ],
-            )
+            selected_grasp_index = int(selection["selected_index"])
             print(
                 "Selected grasp:",
-                selected_grasp,
+                f"index={selected_grasp_index}, "
+                f"graspnet={selection['selected_score']:.4f}, "
+                f"angle={selection['selected_angle_deg']:.2f} deg, "
+                f"xy_dist={selection['selected_xy_distance']:.4f} m, "
+                f"final={selection['selected_final_score']:.4f}",
             )
 
             selected_grasp_angle_deg = float(
@@ -3220,7 +3409,7 @@ def main():
 
             # Diagnostic only: reproduce the pose conversion used by
             # execute_grasp_pose_ik() so we can inspect the selected target
-            # before any motion is commanded. PyBullet-style over is WORLD
+            # before any motion is commanded. The pregrasp offset is WORLD
             # +Z by 0.20 m while preserving the final grasp orientation.
             selected_grasp_eef_pose = (
                 env.grasp_tip_pose_to_eef_pose(
@@ -3236,42 +3425,11 @@ def main():
             )
             predicted_pregrasp_pose[2, 3] += 0.20
 
-            print()
             print(
-                "Selected grasp angle degrees:",
-                selected_grasp_angle_deg,
-            )
-            print(
-                "Selected grasp center xyz:",
-                selected_grasp[:3],
-            )
-            print(
-                "Selected grasp quaternion xyzw:",
-                selected_grasp[3:],
-            )
-            print(
-                "Selected grasp EEF target position xyz:",
-                selected_grasp_eef_pose[:3, 3],
-            )
-            print(
-                "Selected grasp EEF target rotation matrix:",
-            )
-            print(
-                selected_grasp_eef_pose[:3, :3]
-            )
-            print(
-                "Selected approach axis:",
-                selected_approach_axis,
-            )
-            print(
-                "Predicted PyBullet-style world-Z over target xyz:",
-                predicted_pregrasp_pose[:3, 3],
-            )
-            print(
-                "Predicted pregrasp target rotation matrix:",
-            )
-            print(
-                predicted_pregrasp_pose[:3, :3]
+                "Selected grasp pose:",
+                f"center={np.round(selected_grasp[:3], 4).tolist()}, "
+                f"approach={np.round(selected_approach_axis, 4).tolist()}, "
+                f"pregrasp={np.round(predicted_pregrasp_pose[:3, 3], 4).tolist()}",
             )
 
             selected_grasp_ply_path = (
@@ -3291,195 +3449,49 @@ def main():
                 )
             )
 
+            # ------------------------------------------------------------
+            # 5. Grasp Execution and Recovery
+            # ------------------------------------------------------------
+
+            print()
             print(
-                "Selected grasp full-scene PLY saved:",
-                selected_grasp_ply_path,
+                "Executing selected grasp with "
+                "IK + q_ref + JOINT_POSITION."
             )
 
-            if GRASP_CONTROL_MODE == "ik":
-                print()
-                print(
-                    "Executing selected grasp with "
-                    "IK + q_ref + JOINT_POSITION."
-                )
-
-                execution = env.execute_grasp_pose_ik(
-                    selected_grasp,
-                    pregrasp_height=0.20,
-                    lift_distance=0.20,
-                    grasp_depth_offset=0.0,
-                    waypoint_spacing=0.01,
-                    qref_speed_rad_per_sec=1.0,
-                    frame_callback=(
-                        lambda _env: recorder.capture_frame()
-                    ),
-                    frame_capture_interval=(
-                        IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
-                    ),
-                    stop_after_pregrasp=(
-                        IK_STOP_AFTER_PREGRASP
-                    ),
-                    stop_after_grasp_pose=(
-                        IK_STOP_AFTER_GRASP_POSE
-                    ),
-                )
-            else:
-                print()
-                print(
-                    "Executing selected grasp with legacy OSC."
-                )
-
-                execution = env.execute_grasp_pose(
-                    selected_grasp,
-                    approach_distance=0.12,
-                    lift_distance=0.10,
-                    grasp_depth_offset=0.0,
-                    # ThinkGrasp原版move_joints超时为3秒。
-                    # 当前MuJoCo控制频率约20Hz，因此使用60步。
-                    max_steps_per_phase=120,
-                    position_tolerance=0.008,
-                    orientation_tolerance=np.deg2rad(4.0),
-                )
-
-            # ---------------------------------------------------------
-            # Staged IK integration stop.
-            #
-            # This is a SUCCESSFUL diagnostic termination, not a failed
-            # grasp. Do not run grasp-success inference, placement, or the
-            # legacy OSC recovery functions while the environment is using
-            # JOINT_POSITION.
-            # ---------------------------------------------------------
-            diagnostic_stage = execution.get(
-                "stopped_for_diagnostic"
+            execution = env.execute_grasp_pose_ik(
+                selected_grasp,
+                pregrasp_height=0.20,
+                lift_distance=0.20,
+                grasp_depth_offset=0.0,
+                waypoint_spacing=0.01,
+                qref_speed_rad_per_sec=1.0,
+                frame_callback=(
+                    lambda _env: recorder.capture_frame()
+                ),
+                frame_capture_interval=(
+                    IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
+                ),
             )
 
-            if diagnostic_stage is not None:
-                diagnostic_completed = True
-                diagnostic_stop_stage = str(
-                    diagnostic_stage
-                )
-
-                actual_pose = (
-                    env.get_eef_pose().copy()
-                )
-
-                print()
-                print("#" * 70)
-                print(
-                    "IK STAGED INTEGRATION DIAGNOSTIC COMPLETED"
-                )
-                print("#" * 70)
-                print(
-                    "Diagnostic stop stage:",
-                    diagnostic_stop_stage,
-                )
-                print(
-                    "Execution success:",
-                    execution.get("success"),
-                )
-                print(
-                    "Failed phase:",
-                    execution.get("failed_phase"),
-                )
-                print(
-                    "Actual EEF xyz at diagnostic stop:",
-                    actual_pose[:3, 3],
-                )
-
-                returned_pregrasp_pose = (
-                    execution.get(
-                        "pregrasp_pose"
-                    )
-                )
-
-                if returned_pregrasp_pose is not None:
-                    returned_pregrasp_pose = np.asarray(
-                        returned_pregrasp_pose,
-                        dtype=np.float64,
-                    ).reshape(4, 4)
-
-                    print(
-                        "Returned pregrasp target xyz:",
-                        returned_pregrasp_pose[:3, 3],
-                    )
-                    print(
-                        "Pregrasp target minus actual xyz:",
-                        (
-                            returned_pregrasp_pose[:3, 3]
-                            - actual_pose[:3, 3]
-                        ),
-                    )
-
-                safe_rest_result = execution.get(
-                    "safe_rest"
-                )
-                if safe_rest_result is not None:
-                    print(
-                        "Safe-rest motion success:",
-                        safe_rest_result.get("success"),
-                    )
-                    print(
-                        "Safe-rest max joint error [rad]:",
-                        safe_rest_result.get(
-                            "max_abs_joint_error"
-                        ),
-                    )
-                    print(
-                        "Safe-rest simulated seconds:",
-                        safe_rest_result.get(
-                            "simulated_seconds"
-                        ),
-                    )
-
-                pregrasp_result = execution.get(
-                    "pregrasp"
-                )
-                if pregrasp_result is not None:
-                    print(
-                        "Pregrasp success:",
-                        pregrasp_result.get("success"),
-                    )
-                    print(
-                        "Pregrasp failure reason:",
-                        pregrasp_result.get(
-                            "failure_reason"
-                        ),
-                    )
-                    print(
-                        "Pregrasp position error [m]:",
-                        pregrasp_result.get(
-                            "position_error_norm"
-                        ),
-                    )
-                    print(
-                        "Pregrasp orientation error [deg]:",
-                        pregrasp_result.get(
-                            "orientation_error_deg"
-                        ),
-                    )
-
-                recorder.capture_frame()
-                recorder.add_hold(2.0)
-
-                print(
-                    "Diagnostic stage complete. "
-                    "Stopping before descent / close / lift."
-                )
-                break
-
             # ---------------------------------------------------------
-            # STRICT-IK FAILURE RECOVERY (JOINT_POSITION ONLY)
+            # IK FAILURE RECOVERY (JOINT_POSITION ONLY)
             #
             # If the selected grasp is not IK-converged / executable,
             # reject this perception cycle, return to the saved home joint
             # configuration using q_ref + JOINT_POSITION, then re-perceive.
-            # No legacy OSC recovery is used.
             # ---------------------------------------------------------
-            if (
-                GRASP_CONTROL_MODE == "ik"
-                and not bool(execution.get("success", False))
-            ):
+            if not bool(execution.get("success", False)):
                 failed_phase = execution.get("failed_phase")
+
+                reward = -1.0
+                episode_reward += reward
+
+                print(
+                    f"Reward: {reward:+.4f} "
+                    f"(grasp execution failed), "
+                    f"episode_reward={episode_reward:+.4f}"
+                )
 
                 print()
                 print("#" * 70)
@@ -3562,18 +3574,23 @@ def main():
                                 ),
                             )
 
-                # Before close/lift, recover with the gripper open.
-                # If failure happened after closing, keep holding during the
-                # home motion and release only after home is reached.
-                hold_during_recovery = bool(
-                    failed_phase in {"close", "lift"}
-                )
+                # Recovery policy:
+                #   - if lift IK fails after the gripper has closed, release
+                #     the object immediately at the current pose, then return
+                #     home with an open gripper;
+                #   - failures before lift return home with the gripper open.
+                if failed_phase == "lift":
+                    print(
+                        "Lift failed after gripper close. "
+                        "Releasing object at current pose before return-home."
+                    )
+                    env.open_gripper(steps=30)
+                    recorder.capture_frame()
+                    recorder.add_hold(0.5)
 
                 recovery_result = env.move_joints_qref(
                     target_joint_positions=home_joint_positions,
-                    gripper_command=(
-                        1.0 if hold_during_recovery else -1.0
-                    ),
+                    gripper_command=-1.0,
                     stop_on_table_contact=False,
                     frame_callback=(
                         lambda _env: recorder.capture_frame()
@@ -3602,23 +3619,22 @@ def main():
                     continue
 
                 print(
-                    "Return-home recovery failed. Stopping this run without "
-                    "calling any legacy OSC controller."
+                    "Return-home recovery failed. Stopping this run."
                 )
                 recorder.capture_frame()
                 recorder.add_hold(2.0)
                 break
 
             # =========================================================
-            # Source-faithful grasp / transport task semantics.
+            # Grasp / transport task semantics.
             #
             # Physical grasp success and task-target success are separate:
             #   - gripper width answers "are we still holding something?"
-            #   - selected 5 cm assignment records which simulator object this
-            #     grasp belongs to for post-transport task evaluation.
+            #   - after release, simulator-side evaluation checks whether the
+            #     task target is inside the bin.
             #
             # Any held object is transported to the bin. Only AFTER release
-            # and JOINT_POSITION return-home do we decide target vs non-target.
+            # and JOINT_POSITION return-home do we evaluate task success.
             # =========================================================
             first_gripper_width = env.get_gripper_width()
 
@@ -3628,116 +3644,71 @@ def main():
                 >= MIN_GRASPED_GRIPPER_WIDTH
             )
 
-            print()
-            print("Motion success:", execution["success"])
             print(
-                "Gripper width after lift:",
-                first_gripper_width,
-            )
-            print(
-                "First gripper-width hold check:",
-                gripper_holds_something,
-            )
-            print(
-                "Selected grasp assigned object:",
-                selected_assigned_object_name,
-            )
-            print(
-                "Selected grasp assigned body id:",
-                selected_assigned_object_body_id,
-            )
-            print(
-                "Fixed testcase target object:",
-                target_object,
-            )
-            print(
-                "Fixed testcase target body id:",
-                target_body_id,
+                "Grasp execution:",
+                f"motion_success={execution['success']}, "
+                f"gripper_width={first_gripper_width:.4f}, "
+                f"hold={gripper_holds_something}",
             )
 
-            for phase_name in [
-                "pregrasp",
-                "grasp",
-                "lift",
-            ]:
+            for phase_name in ["pregrasp", "grasp", "lift"]:
                 phase_result = execution.get(phase_name)
-
                 if phase_result is None:
                     continue
 
-                print()
-                print(
-                    f"{phase_name} success:",
-                    phase_result.get("success"),
-                )
-                print(
-                    f"{phase_name} failure reason:",
-                    phase_result.get("failure_reason"),
-                )
-                print(
-                    f"{phase_name} position error:",
-                    phase_result.get("position_error_norm"),
-                )
-
-                phase_diagnostic = (
-                    summarize_ik_phase_diagnostic(
-                        phase_result
-                    )
+                phase_diagnostic = summarize_ik_phase_diagnostic(phase_result)
+                position_error = phase_result.get("position_error_norm")
+                position_error_text = (
+                    "n/a"
+                    if position_error is None
+                    else f"{1000.0 * float(position_error):.2f} mm"
                 )
 
                 print(
-                    f"{phase_name} diagnostic motion segments:",
-                    phase_diagnostic["motion_segments"],
+                    f"{phase_name}: "
+                    f"success={phase_result.get('success')}, "
+                    f"pos_err={position_error_text}, "
+                    f"steps={phase_diagnostic['physics_steps']}, "
+                    f"force_stop={phase_diagnostic['force_stop_triggered']}"
                 )
-                print(
-                    f"{phase_name} diagnostic physics steps:",
-                    phase_diagnostic["physics_steps"],
-                )
-                print(
-                    f"{phase_name} diagnostic simulated seconds:",
-                    phase_diagnostic["simulated_seconds"],
-                )
-                print(
-                    f"{phase_name} diagnostic max tracking error [rad]:",
-                    phase_diagnostic["max_tracking_error_seen"],
-                )
-                print(
-                    f"{phase_name} diagnostic max raw torque:",
-                    phase_diagnostic["max_raw_torque_seen"],
-                )
-                print(
-                    f"{phase_name} diagnostic max relevant contacts/step:",
-                    phase_diagnostic["max_relevant_contact_count"],
-                )
-                print(
-                    f"{phase_name} diagnostic contact pairs:",
-                    phase_diagnostic["diagnostic_contact_pairs"],
-                )
-                print(
-                    f"{phase_name} source-style max EEF force metric:",
-                    phase_diagnostic["max_eef_force_metric_seen"],
-                )
-                print(
-                    f"{phase_name} force-stop triggered:",
-                    phase_diagnostic["force_stop_triggered"],
-                )
-                if phase_diagnostic["force_stop_triggered"]:
+
+                if (
+                    phase_diagnostic["force_stop_triggered"]
+                    or not bool(phase_result.get("success", False))
+                ):
                     print(
-                        f"{phase_name} force-stop metric:",
-                        phase_diagnostic["force_stop_metric"],
+                        f"  {phase_name} diagnostics: "
+                        f"max_force={phase_diagnostic['max_eef_force_metric_seen']}, "
+                        f"max_tracking={phase_diagnostic['max_tracking_error_seen']}, "
+                        f"max_torque={phase_diagnostic['max_raw_torque_seen']}"
                     )
-                    print(
-                        f"{phase_name} force-stop wrench [Fx Fy Fz Mx My Mz]:",
-                        phase_diagnostic["force_stop_wrench"],
-                    )
+                    if phase_diagnostic["diagnostic_contact_pairs"]:
+                        print(
+                            f"  {phase_name} contacts:",
+                            phase_diagnostic["diagnostic_contact_pairs"],
+                        )
+                    if phase_diagnostic["force_stop_triggered"]:
+                        print(
+                            f"  {phase_name} force-stop metric:",
+                            phase_diagnostic["force_stop_metric"],
+                        )
 
             # Physical grasp failed: no object is retained by the gripper.
-            # Formal IK mode uses JOINT_POSITION recovery only.
+            # Recovery uses JOINT_POSITION only.
             if not gripper_holds_something:
                 print()
                 print(
                     "Physical grasp failed: gripper-width check indicates "
                     "that no object is being held."
+                )
+
+                reward = -1.0
+                episode_reward += reward
+
+                print(
+                    f"Reward: {reward:+.4f} "
+                    f"(empty grasp), "
+                    f"episode_reward={episode_reward:+.4f}"
                 )
 
                 recovery_result = env.move_joints_qref(
@@ -3759,8 +3730,7 @@ def main():
 
                 if not recovery_result["success"]:
                     print(
-                        "Return-home recovery failed. Stopping without "
-                        "legacy OSC recovery."
+                        "Return-home recovery failed. Stopping this run."
                     )
                     break
 
@@ -3773,31 +3743,53 @@ def main():
                 )
                 continue
 
-            print()
-            print(
-                "Physical grasp succeeded. Transporting the held object "
-                "before evaluating target vs non-target."
+            # PyBullet-style grasped-object identification after lift.
+            grasped_obj_id = None
+            grasped_obj_name = None
+            max_height = -np.inf
+
+            for object_name, body_id in env.object_body_ids.items():
+                object_position = np.asarray(
+                    env.sim.data.body_xpos[int(body_id)],
+                    dtype=np.float64,
+                )
+
+                if float(object_position[2]) >= max_height:
+                    max_height = float(object_position[2])
+                    grasped_obj_id = int(body_id)
+                    grasped_obj_name = object_name
+
+            grasped_object_position = np.asarray(
+                env.sim.data.body_xpos[grasped_obj_id],
+                dtype=np.float64,
             )
 
-            # =========================================================
-            # PyBullet-style fixed joint-space transport.
-            #
-            # Original ThinkGrasp moves the held object to a fixed
-            # drop joint configuration after lift. Do the same here:
-            # no workspace-centre IK, no straighten IK, no bin IK.
-            # =========================================================
-            print()
-            print(
-                "Starting PyBullet-style fixed JOINT_POSITION transport."
+            target_position_after_lift = np.asarray(
+                env.sim.data.body_xpos[target_body_id],
+                dtype=np.float64,
             )
+
+            pos_dist = float(
+                np.linalg.norm(
+                    grasped_object_position
+                    - target_position_after_lift
+                )
+            )
+
+            print(
+                "Grasped object:",
+                f"{grasped_obj_name}, "
+                f"target_distance={pos_dist:.4f} m",
+            )
+
+            # ------------------------------------------------------------
+            # 6. Transport and Task Evaluation
+            # ------------------------------------------------------------
+
+            print("Transporting held object to the bin.")
 
             recorder.capture_frame()
             recorder.add_hold(0.5)
-
-            print(
-                "Fixed Panda drop joints:",
-                PANDA_DROP_JOINTS,
-            )
 
             drop_motion_result = env.move_joints_qref(
                 target_joint_positions=PANDA_DROP_JOINTS,
@@ -3812,22 +3804,27 @@ def main():
             )
 
             print(
-                "Fixed drop-joint transport success:",
-                drop_motion_result["success"],
-            )
-            print(
-                "Fixed drop-joint transport failure reason:",
-                drop_motion_result["failure_reason"],
+                "Transport:",
+                f"success={drop_motion_result['success']}, reason={drop_motion_result['failure_reason']}",
             )
 
             if not drop_motion_result["success"]:
                 print(
                     "Fixed drop-joint transport failed."
                 )
+
+                reward = -1.0
+                episode_reward += reward
+
+                print(
+                    f"Reward: {reward:+.4f} "
+                    f"(transport failed), "
+                    f"episode_reward={episode_reward:+.4f}"
+                )
                 break
 
             # ---------------------------------------------------------
-            # Second original-style gripper-state check:
+            # Second gripper-state check:
             # after reaching the drop/bin pose, immediately before release.
             # ---------------------------------------------------------
             width_before_release = env.get_gripper_width()
@@ -3837,18 +3834,23 @@ def main():
             )
 
             print(
-                "Gripper width at bin before release:",
-                width_before_release,
-            )
-            print(
-                "Second gripper-width hold check:",
-                still_holding_at_bin,
+                "Hold at bin:",
+                f"{still_holding_at_bin} (width={width_before_release:.4f})",
             )
 
             if not still_holding_at_bin:
                 print(
                     "Held object was lost during transport. Returning home "
                     "without issuing an intentional bin-release command."
+                )
+
+                reward = -1.0
+                episode_reward += reward
+
+                print(
+                    f"Reward: {reward:+.4f} "
+                    f"(object lost during transport), "
+                    f"episode_reward={episode_reward:+.4f}"
                 )
 
                 return_home_result = env.move_joints_qref(
@@ -3880,24 +3882,35 @@ def main():
                 )
                 continue
 
+            if grasped_obj_id == target_body_id:
+                reward = 2.0
+                reward_reason = "correct target"
+            else:
+                reward = -pos_dist / max_pos_dist
+                reward_reason = f"wrong object: {grasped_obj_name}"
+
+            episode_reward += reward
+
+            print(
+                f"Reward: {reward:+.4f} "
+                f"({reward_reason}), "
+                f"episode_reward={episode_reward:+.4f}"
+            )
+
             # Physical transport succeeded. Release the held object in the bin.
             open_result = env.open_gripper(steps=40)
             width_after_release = env.get_gripper_width()
 
             print(
-                "Gripper width after intentional bin release:",
-                width_after_release,
-            )
-            print(
-                "Release command width:",
-                open_result["width"],
+                "Released object in bin:",
+                f"gripper_width={width_after_release:.4f}",
             )
 
             recorder.capture_frame()
             recorder.add_hold(1.0)
 
-            # Source-faithful ordering:
-            # release -> home -> THEN evaluate target/non-target and re-perceive.
+            # Ordering:
+            # release -> home -> evaluate target success -> re-perceive if needed.
             return_home_result = env.move_joints_qref(
                 target_joint_positions=home_joint_positions,
                 gripper_command=-1.0,
@@ -3910,79 +3923,65 @@ def main():
                 ),
             )
 
-            print(
-                "JOINT_POSITION return home after release success:",
-                return_home_result["success"],
-            )
+            print("Return home after release:", return_home_result["success"])
 
             if not return_home_result["success"]:
                 print(
-                    "Return home after release failed; stopping without "
-                    "legacy OSC recovery."
+                    "Return home after release failed; stopping this run."
                 )
                 break
 
-            moved_target_object = bool(
-                selected_assigned_object_name == target_object
-                and selected_assigned_object_body_id == target_body_id
+            # Final simulator-side task evaluation:
+            # do not use the pre-grasp nearest-object bookkeeping to decide
+            # which object was actually transported. Instead, directly check
+            # whether the task target body is now inside the bin.
+            target_position_after_release = np.asarray(
+                env.sim.data.body_xpos[target_body_id],
+                dtype=np.float64,
+            ).copy()
+
+            target_inside_bin = bool(
+                abs(
+                    float(target_position_after_release[0])
+                    - float(env.bin_center[0])
+                )
+                <= float(env.bin_inner_half_size[0])
+                and
+                abs(
+                    float(target_position_after_release[1])
+                    - float(env.bin_center[1])
+                )
+                <= float(env.bin_inner_half_size[1])
             )
 
-            print()
             print(
-                "Released object identity from selected 5 cm assignment:",
-                selected_assigned_object_name,
-            )
-            print(
-                "Released object is fixed testcase target:",
-                moved_target_object,
+                "Task evaluation:",
+                f"target_inside_bin={target_inside_bin}, "
+                f"target_xyz={np.round(target_position_after_release, 4).tolist()}",
             )
 
-            if moved_target_object:
+            if target_inside_bin:
                 target_completed = True
                 print(
-                    f"Target {target_object} was transported to the bin, "
-                    "released, and the robot returned home."
+                    f"Target {target_object} is inside the bin. "
+                    "Closed-loop task completed."
                 )
                 break
 
             print(
-                "A non-target object was successfully removed to the bin. "
-                "done=False; robot is home, so re-perceiving the changed scene."
+                f"Target {target_object} is not inside the bin. "
+                "Robot is home, so re-perceiving the changed scene."
             )
             recorder.capture_frame()
             recorder.add_hold(0.5)
             continue
 
-        if diagnostic_completed:
-            print()
-            print(
-                f"Closed-loop diagnostic ended after "
-                f"{attempts_started} perception attempt(s)."
-            )
-            print(
-                "Diagnostic result: SUCCESSFUL staged stop at",
-                diagnostic_stop_stage,
-            )
-            print(
-                "No descent / close / lift / placement was executed."
-            )
-        elif ik_failure_stopped_safely:
-            print()
-            print(
-                f"Closed-loop IK diagnostic ended after "
-                f"{attempts_started} perception attempt(s)."
-            )
-            print(
-                "Diagnostic result: SAFE STOP after IK failure."
-            )
-            print(
-                "IK failed phase:",
-                ik_failure_phase,
-            )
-            print(
-                "Legacy OSC recovery was not executed."
-            )
-        elif not target_completed:
+        print()
+        print(
+            f"Final episode reward: {episode_reward:+.4f}"
+        )
+
+        if not target_completed:
             print()
             print(
                 f"Closed-loop task ended after "
@@ -3991,9 +3990,8 @@ def main():
 
             if ended_no_grasp_after_fallback:
                 print(
-                    "Stop reason: source-style target crop and "
-                    "full-scene fallback produced no grasp assigned "
-                    "to the fixed GT target."
+                    "Stop reason: target-region planning and "
+                    "full-scene fallback produced no usable grasp."
                 )
             elif attempts_started >= MAX_ATTEMPTS:
                 print(
@@ -4019,12 +4017,10 @@ def main():
 
                 video_path = recorder.save()
 
-                print()
-                print("Closed-loop video saved:")
-                print(video_path)
                 print(
-                    "Recorded frames:",
-                    len(recorder.frames),
+                    "Closed-loop video:",
+                    video_path,
+                    f"({len(recorder.frames)} frames)",
                 )
         except Exception as video_error:
             print(
@@ -4034,7 +4030,6 @@ def main():
         finally:
             recorder.stop()
             env.close()
-
 
 if __name__ == "__main__":
     _run_with_log()

@@ -103,10 +103,6 @@ def main():
     pointcloud.points = o3d.utility.Vector3dVector(points)
     pointcloud.colors = o3d.utility.Vector3dVector(colors)
 
-    print("Input:", input_path)
-    print("Input points:", len(pointcloud.points))
-    print("Mode: return all collision-filtered GraspNet poses")
-    print("GraspNet semantic text input: NONE (point cloud only)")
 
     graspnet = Graspnet()
 
@@ -114,7 +110,6 @@ def main():
         pointcloud
     )
 
-    print("Raw grasp count:", len(grasp_group))
 
     # Keep GraspNet's original collision detection. Disable later
     # MuJoCo-specific hard angle / height deletion so the MuJoCo main
@@ -186,10 +181,6 @@ def main():
         "diagnostic_source_indices": diagnostic_source_indices,
     }
 
-    print(
-        "Total collision-filtered grasp poses:",
-        len(target_pose_array),
-    )
 
     output_path.parent.mkdir(
         parents=True,
@@ -201,7 +192,13 @@ def main():
         **output_data,
     )
 
-    print("Output:", output_path)
+    print(
+        "GRASPNET_SUMMARY "
+        f"input_points={len(pointcloud.points)} "
+        f"raw_grasps={len(grasp_group)} "
+        f"collision_filtered={len(target_pose_array)}"
+    )
+
 
 
 if __name__ == "__main__":

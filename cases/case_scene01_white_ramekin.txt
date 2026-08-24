@@ -1,0 +1,2 @@
+Pick up the white ramekin and place it in the bin.
+white_ramekin

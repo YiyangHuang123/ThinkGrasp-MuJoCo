@@ -1,27 +1,88 @@
-The input image is 224x224 pixels. For every bounding-box and centroid coordinate, use Qwen3-VL's native relative coordinate system ranging from 0 to 1000, not absolute pixel coordinates.
+Use Qwen3-VL's 0-to-1000 normalized relative coordinate system for all bounding-box and centroid coordinates, independent of the actual image resolution.
+
 Perform the following steps:
+
 Target Object Selection:
-Identify the object in the image that best matches the instruction. If the target object is found, select it as the target object.
-If the target object is not visible, select the most cost-effective object or object part considering ease of grasping, importance, and safety.
-If the object has a handle or a part that is easier or safer to grasp, strongly prefer to select that part.
-Consider the geometric shape of the objects and the gripper's success rate when selecting the target object or object part.
-Output the name of the selected object or object part as [object:color and name] or [object part:color and name]..
-Round object means like ball. Cup is different from mug.Cropping Box Calculation:
-Calculate a cropping box that includes the target object and all surrounding objects that might be relevant for grasping.
+
+First determine whether the instructed target object is directly graspable.
+
+If the target object is visible and can be safely grasped with sufficient free space for a parallel-jaw two-finger gripper, select the target object.
+
+If the target object is visible but is obstructed, covered, tightly surrounded, or difficult to access safely, do not automatically select the target object. Instead, select the object or object part that most directly blocks access to the target and whose removal would most improve the target's graspability.
+
+If the target object is not visible, select the object most likely to obstruct or cover the target, prioritizing objects whose removal would improve target visibility and access.
+
+Prefer task-relevant obstruction removal over choosing an unrelated object that is merely easier to grasp.
+
+If an object has a clearly visible part that provides a substantially safer or more reliable grasp, such as a handle, that object part may be selected.
+
+Consider the geometric shape of the objects, local free space, collision risk, and suitability for a parallel-jaw two-finger gripper when selecting the target object or object part.
+
+Output the name of the selected object or object part as [object:color and name] or [object part:color and name].
+
+Treat spherical objects such as balls as round objects. Distinguish cups from mugs.
+
+Selection Reason:
+
+Briefly state why the selected object or object part was chosen.
+
+Examples:
+Selection Reason: target directly graspable
+Selection Reason: obstruction removal; black cartridge blocks access to the white ramekin
+
+Cropping Box Calculation:
+
+Calculate a cropping box that includes the selected object and only nearby objects that may physically affect its grasping or removal.
+
+The cropping box is a local planning context region and does not need to tightly match the selected object's exact boundary.
+
 Provide the cropping box as (top-left x, top-left y, bottom-right x, bottom-right y), with every value expressed in the 0-to-1000 relative coordinate system.
+
 Object Properties within Cropping Box:
+
 For each object within the cropping box, provide the following properties:
-Grasping Score: Evaluate the ease or difficulty of grasping the object on a scale from 0 to 100 (0 being extremely difficult, 100 being extremely easy).
-Material Composition: Evaluate the material composition of the object on a scale from 0 to 100 (0 being extremely weak, 100 being extremely strong).
-Surface Texture: Evaluate the texture of the object's surface on a scale from 0 to 100 (0 being extremely smooth, 100 being extremely rough).
-Stability Assessment: Assess the stability of the object on a scale from 0 to 100 (0 being extremely unstable, 100 being extremely stable).
-Centroid Coordinates: Provide the object center as (x, y), using the same 0-to-1000 relative coordinate system across the entire image.
-Preferred Grasping Location: Divide the cropping box into a 3x3 grid and return a number from 1 to 9 indicating the preferred grasping location (1 for top-left, 9 for bottom-right).
-Additionally, consider the preferred grasping location that is most successful for the UR5 robotic arm and gripper.
+
+Grasping Score:
+Evaluate the ease or difficulty of grasping the object on a scale from 0 to 100, where 0 means extremely difficult and 100 means extremely easy.
+
+Material Composition:
+Evaluate the material composition of the object on a scale from 0 to 100, where 0 means extremely weak and 100 means extremely strong.
+
+Surface Texture:
+Evaluate the texture of the object's surface on a scale from 0 to 100, where 0 means extremely smooth and 100 means extremely rough.
+
+Stability Assessment:
+Assess the stability of the object on a scale from 0 to 100, where 0 means extremely unstable and 100 means extremely stable.
+
+Centroid Coordinates:
+Provide the visual center of the corresponding object or object part itself.
+
+For the selected object, determine the centroid from its visible extent rather than from the cropping-box geometry or surrounding context.
+
+The centroid may coincide with the cropping-box center when the selected object is genuinely centered there.
+
+Preferred Grasping Location:
+Divide the selected object's local grasping region into a 3x3 grid and return a number from 1 to 9 indicating the preferred grasping location:
+1 = top-left
+2 = top-center
+3 = top-right
+4 = middle-left
+5 = center
+6 = middle-right
+7 = bottom-left
+8 = bottom-center
+9 = bottom-right
+
+Choose the preferred grasping location based on visible geometry, local free space, collision risk, and suitability for a parallel-jaw two-finger gripper.
+
 Output should be in the following format:
+
 Selected Object/Object Part: [object:color and name] or [object part:color and name]
+Selection Reason: [brief reason]
 Cropping Box Coordinates: (top-left x, top-left y, bottom-right x, bottom-right y)
+
 Objects and Their Properties:
+
 Object: [color and name]
 Grasping Score: [value]
 Material Composition: [value]
@@ -29,29 +90,29 @@ Surface Texture: [value]
 Stability Assessment: [value]
 Centroid Coordinates: (x, y)
 Preferred Grasping Location: [value]
+
 ...
+
 Example Output:
-Selected Object/Object Part: [object:blue ball]
-Cropping Box Coordinates: (223, 223, 893, 893)
+
+Selected Object/Object Part: [object:black cartridge]
+Selection Reason: obstruction removal; black cartridge blocks access to the white ramekin
+Cropping Box Coordinates: (300, 250, 760, 720)
+
 Objects and Their Properties:
-Object: Blue Ball
-Grasping Score: 90
-Material Composition: 80
-Surface Texture: 20
-Stability Assessment: 95
-Centroid Coordinates: (558, 558)
+
+Object: Black Cartridge
+Grasping Score: 82
+Material Composition: 78
+Surface Texture: 35
+Stability Assessment: 75
+Centroid Coordinates: (520, 430)
 Preferred Grasping Location: 5
-Object: Yellow Bottle
-Grasping Score: 75
+
+Object: White Ramekin
+Grasping Score: 60
 Material Composition: 70
 Surface Texture: 30
 Stability Assessment: 80
-Centroid Coordinates: (100, 150)
-Preferred Grasping Location: 3
-Object: Black and Blue Scissors
-Grasping Score: 60
-Material Composition: 85
-Surface Texture: 40
-Stability Assessment: 70
-Centroid Coordinates: (175, 175)
-Preferred Grasping Location: 7
+Centroid Coordinates: (560, 560)
+Preferred Grasping Location: 5

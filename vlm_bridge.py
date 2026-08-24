@@ -1,8 +1,7 @@
-"""Qwen3-VL bridge for the MuJoCo ThinkGrasp closed loop.
+"""Qwen3-VL interface for closed-loop robotic grasping.
 
-This module uses a project-local frozen copy of the original ThinkGrasp
-VLM system prompt (`vlm_system_prompt.txt`) and parses the same structured
-response format that was validated in test_vlm_original_prompt.py.
+This module loads the project-local VLM system prompt and parses the
+structured selection output used by the perception pipeline.
 """
 
 import base64
@@ -22,7 +21,7 @@ def load_image_as_base64(image_path):
 
 
 def load_system_prompt(system_prompt_path=None):
-    """Load the project-local frozen copy of the original ThinkGrasp prompt."""
+    """Load the project-local VLM system prompt."""
 
     if system_prompt_path is None:
         system_prompt_path = (
@@ -75,6 +74,7 @@ def process_grasping_result(
 
     result = {
         "selected_object": None,
+        "selection_reason": None,
         "cropping_box": None,
         "cropping_box_relative": None,
         "objects": [],
@@ -112,6 +112,16 @@ def process_grasping_result(
 
             result["selected_object"] = (
                 selected_object
+            )
+
+        elif line.startswith(
+            "Selection Reason:"
+        ):
+            result["selection_reason"] = (
+                line.split(
+                    ":",
+                    1,
+                )[1].strip()
             )
 
         elif line.startswith(
@@ -372,6 +382,9 @@ def run_vlm_selection(
         "result": result,
         "selected_object": result[
             "selected_object"
+        ],
+        "selection_reason": result[
+            "selection_reason"
         ],
         "selected_properties": (
             selected_properties

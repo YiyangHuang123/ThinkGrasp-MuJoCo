@@ -1,0 +1,2 @@
+Pick up the rhino figure and place it in the bin.
+rhino_figure

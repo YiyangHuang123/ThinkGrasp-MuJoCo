@@ -1,0 +1,2 @@
+Pick up the Mario figure and place it in the bin.
+mario_figure

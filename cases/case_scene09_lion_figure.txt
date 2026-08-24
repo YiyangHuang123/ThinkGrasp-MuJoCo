@@ -1,0 +1,2 @@
+Pick up the lion figure and place it in the bin.
+lion_figure
