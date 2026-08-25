@@ -22,7 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR
 
 # Keep the MuJoCo migration prototype self-contained: prefer the local
-# grasp_detetor.py. The original ThinkGrasp root remains available only for
+# grasp_detector.py. The original ThinkGrasp root remains available only for
 # its GraspNet model / utils dependencies imported by that detector.
 if str(SCRIPT_DIR) in sys.path:
     sys.path.remove(str(SCRIPT_DIR))
@@ -31,7 +31,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from grasp_detetor import Graspnet
+from grasp_detector import Graspnet
 
 
 def parse_args():
