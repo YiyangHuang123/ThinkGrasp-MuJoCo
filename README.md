@@ -1,8 +1,8 @@
 # ThinkGrasp-MuJoCo
 
-A MuJoCo migration and closed-loop reproduction of the ThinkGrasp robotic grasping pipeline.
+A MuJoCo-based closed-loop robotic grasping system developed from the ThinkGrasp codebase and task formulation.
 
-This project replaces the original PyBullet simulation environment with MuJoCo while preserving the main ThinkGrasp perception and grasp-planning ideas. The current simulator uses a Franka Emika Panda with the Franka Hand.
+This work started from ThinkGrasp, but the current implementation has been substantially modified for the MuJoCo-based system developed in this project. Major changes include the simulation backend, Franka Panda control stack, perception and weighted grasp-candidate ranking, closed-loop execution logic, and multi-scene evaluation framework. The current simulator uses a Franka Emika Panda with the Franka Hand.
 
 ## Pipeline
 
@@ -284,6 +284,8 @@ GroundingDINO_SwinB.cfg.py
 groundingdino_swinb_cogcoor.pth
 ```
 
+`run_groundingdino_inference.py` obtains these files through the Hugging Face Hub and reuses the local Hugging Face cache on later runs. The first run therefore requires network access unless the required files are already present in the cache.
+
 GroundingDINO receives a high-resolution RAW top-view crop derived from the configured world workspace. The crop is computed from RAW per-pixel world coordinates rather than from a fixed image-space rectangle.
 
 ## GraspNet
@@ -406,7 +408,7 @@ Before running the full closed loop, validate the installation:
 python scripts/validate_installation.py
 ```
 
-The validator is intended to catch missing core runtime dependencies before a long closed-loop run. Scene-specific GSO source assets are also checked when the selected MuJoCo scene is constructed.
+The validator is intended to catch missing core runtime dependencies before a long closed-loop run. It also reads `GSO_SCENE_OBJECT_SPECS` directly and validates the assets used by all 10 configured scenes: 50 scene-object slots, 49 unique GSO model directories, each model XML, and the external mesh / texture files referenced by those XML files.
 
 A robosuite warning about the optional Mink-based whole-body IK controller for GR1 may appear during import. The current Panda pipeline uses its own IK and JOINT_POSITION path and does not rely on that GR1 controller.
 
@@ -570,6 +572,32 @@ grasp_videos/
 
 Generated NPZ files, PLY files, images, videos, logs, compiled extensions, and other runtime artifacts are excluded from Git.
 
+## ThinkGrasp Origin and Citation
+
+This repository started from the ThinkGrasp codebase and task formulation, but the current implementation has been substantially modified. The main changes in this project cover the MuJoCo simulation backend, Franka Panda IK + joint-position control, perception and weighted grasp ranking, closed-loop recovery / fallback behavior, and multi-scene evaluation.
+
+Original ThinkGrasp project:
+
+- Paper: *ThinkGrasp: A Vision-Language System for Strategic Part Grasping in Clutter*
+- Authors: Yaoyao Qian, Xupeng Zhu, Ondrej Biza, Shuo Jiang, Linfeng Zhao, Haojie Huang, Yu Qi, Robert Platt
+- Official code: https://github.com/H-Freax/ThinkGrasp
+- Proceedings: https://proceedings.mlr.press/v270/qian25c.html
+
+If you use the ThinkGrasp-derived parts of this repository, please cite the original work:
+
+```bibtex
+@InProceedings{pmlr-v270-qian25c,
+  title     = {ThinkGrasp: A Vision-Language System for Strategic Part Grasping in Clutter},
+  author    = {Qian, Yaoyao and Zhu, Xupeng and Biza, Ondrej and Jiang, Shuo and Zhao, Linfeng and Huang, Haojie and Qi, Yu and Platt, Robert},
+  booktitle = {Proceedings of The 8th Conference on Robot Learning},
+  pages     = {3568--3586},
+  year      = {2025},
+  volume    = {270},
+  series    = {Proceedings of Machine Learning Research},
+  publisher = {PMLR}
+}
+```
+
 ## Third-Party Components
 
 This repository contains project-local copies or subsets of third-party components used by the ThinkGrasp pipeline.
@@ -588,7 +616,7 @@ assets/scanned_objects/README.md
 assets/scanned_objects/VERSION
 ```
 
-These components remain subject to their respective upstream licenses.
+These components remain subject to their respective upstream licenses and terms. The original ThinkGrasp codebase is also distributed under its upstream license; a repository-level license for this modified project should not be interpreted as replacing the licenses of bundled third-party components.
 
 ## Project Status
 
