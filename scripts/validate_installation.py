@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
-import importlib.util
+import ast
 import json
 import os
 import subprocess
 import sys
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -35,13 +36,10 @@ REQUIRED_ASSET_ROOT = (
     / "models"
 )
 
-REQUIRED_OBJECTS = [
-    "ACE_Coffee_Mug_Kristen_16_oz_cup",
-    "BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup",
-    "Canon_Pixma_Ink_Cartridge_8",
-    "Circo_Fish_Toothbrush_Holder_14995988",
-    "Ecoforms_Cup_B4_SAN",
-]
+ENVIRONMENT_SCRIPT = (
+    PROJECT_ROOT
+    / "thinkgrasp_minimal_env.py"
+)
 
 
 results = []
@@ -217,27 +215,182 @@ def check_checkpoint():
     )
 
 
-def check_assets():
+def load_required_gso_models():
+    """Read GSO model names directly from GSO_SCENE_OBJECT_SPECS.
+
+    Parse the environment source with ast instead of importing it so the
+    asset check stays independent of MuJoCo / robosuite initialization.
+    """
+
+    if not ENVIRONMENT_SCRIPT.is_file():
+        raise FileNotFoundError(
+            f"Missing environment script: {ENVIRONMENT_SCRIPT}"
+        )
+
+    source = ENVIRONMENT_SCRIPT.read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(
+        source,
+        filename=str(ENVIRONMENT_SCRIPT),
+    )
+
+    scene_specs = None
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Name)
+                and target.id == "GSO_SCENE_OBJECT_SPECS"
+            ):
+                scene_specs = ast.literal_eval(
+                    node.value
+                )
+                break
+
+        if scene_specs is not None:
+            break
+
+    if not isinstance(scene_specs, dict) or not scene_specs:
+        raise RuntimeError(
+            "Could not read GSO_SCENE_OBJECT_SPECS from "
+            f"{ENVIRONMENT_SCRIPT.name}"
+        )
+
+    required_models = sorted(
+        {
+            object_spec["model_dir"]
+            for scene_objects in scene_specs.values()
+            for object_spec in scene_objects
+        }
+    )
+
+    scene_object_slots = sum(
+        len(scene_objects)
+        for scene_objects in scene_specs.values()
+    )
+
+    return (
+        scene_specs,
+        required_models,
+        scene_object_slots,
+    )
+
+
+def find_missing_model_files(model_dir):
+    """Return files referenced by one GSO MJCF that are missing on disk."""
+
+    model_xml = model_dir / "model.xml"
+
+    if not model_xml.is_file():
+        return [model_xml.name]
+
     missing = []
 
-    for name in REQUIRED_OBJECTS:
-        model_dir = REQUIRED_ASSET_ROOT / name
+    try:
+        root = ET.parse(
+            model_xml
+        ).getroot()
+    except Exception as exc:
+        return [
+            f"model.xml (parse error: {exc})"
+        ]
 
-        if not (model_dir / "model.obj").is_file():
-            missing.append(name)
+    if not (model_dir / "model.obj").is_file():
+        missing.append("model.obj")
 
-    if missing:
+    for element in root.iter():
+        file_attribute = element.get("file")
+
+        if not file_attribute:
+            continue
+
+        referenced_path = (
+            model_dir / file_attribute
+        )
+
+        if not referenced_path.is_file():
+            missing.append(file_attribute)
+
+    return sorted(set(missing))
+
+
+def check_assets():
+    try:
+        (
+            scene_specs,
+            required_models,
+            scene_object_slots,
+        ) = load_required_gso_models()
+    except Exception as exc:
         record(
             "Scanned-object assets",
             False,
-            "missing: " + ", ".join(missing),
+            repr(exc),
         )
-    else:
+        return
+
+    missing_models = []
+    incomplete_models = []
+
+    for name in required_models:
+        model_dir = REQUIRED_ASSET_ROOT / name
+
+        if not model_dir.is_dir():
+            missing_models.append(name)
+            continue
+
+        missing_files = find_missing_model_files(
+            model_dir
+        )
+
+        if missing_files:
+            incomplete_models.append(
+                (name, missing_files)
+            )
+
+    if missing_models or incomplete_models:
+        details = []
+
+        if missing_models:
+            details.append(
+                "missing model directories: "
+                + ", ".join(missing_models)
+            )
+
+        if incomplete_models:
+            incomplete_summary = "; ".join(
+                (
+                    f"{name}: "
+                    + ", ".join(files)
+                )
+                for name, files
+                in incomplete_models
+            )
+            details.append(
+                "incomplete model files: "
+                + incomplete_summary
+            )
+
         record(
             "Scanned-object assets",
-            True,
-            f"{len(REQUIRED_OBJECTS)} required objects present",
+            False,
+            " | ".join(details),
         )
+        return
+
+    record(
+        "Scanned-object assets",
+        True,
+        (
+            f"{len(scene_specs)} scenes, "
+            f"{scene_object_slots} scene-object slots, "
+            f"{len(required_models)} unique GSO models present"
+        ),
+    )
 
 
 def check_vlm():
