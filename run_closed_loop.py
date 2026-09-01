@@ -2414,6 +2414,88 @@ def summarize_ik_phase_diagnostic(phase_result):
 # Closed-Loop Task Execution
 # ============================================================
 
+def settle_attempt_reward(
+    reward,
+    reason,
+    episode_reward,
+    attempt_reward_settled,
+):
+    if attempt_reward_settled:
+        print(
+            "Reward already settled for this attempt; "
+            f"skipping duplicate reward ({reason})."
+        )
+        return episode_reward, attempt_reward_settled
+
+    episode_reward += float(reward)
+    attempt_reward_settled = True
+
+    print(
+        f"Reward: {float(reward):+.4f} "
+        f"({reason}), "
+        f"episode_reward={episode_reward:+.4f}"
+    )
+
+    return episode_reward, attempt_reward_settled
+
+
+def recover_open_gripper_home(
+    env,
+    recorder,
+    home_joint_positions,
+    reason,
+):
+    print()
+    print("#" * 70)
+    print("EXECUTION RECOVERY - OPEN GRIPPER, RETURN HOME")
+    print("#" * 70)
+    print("Recovery reason:", reason)
+    print("Opening gripper at the current configuration.")
+
+    env.open_gripper(steps=30)
+    recorder.capture_frame()
+    recorder.add_hold(0.5)
+
+    recovery_result = env.move_joints_qref(
+        target_joint_positions=home_joint_positions,
+        gripper_command=-1.0,
+        stop_on_table_contact=False,
+        frame_callback=(
+            lambda _env: recorder.capture_frame()
+        ),
+        frame_capture_interval=(
+            IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
+        ),
+    )
+
+    print(
+        "Return-home recovery success:",
+        recovery_result["success"],
+    )
+    print(
+        "Return-home recovery failure reason:",
+        recovery_result["failure_reason"],
+    )
+
+    if recovery_result["success"]:
+        env.open_gripper(steps=30)
+        recorder.capture_frame()
+        recorder.add_hold(0.5)
+
+        print(
+            "Recovery complete. Starting a new perception / "
+            "planning cycle."
+        )
+        return True
+
+    print(
+        "Return-home recovery failed. Terminating current run."
+    )
+    recorder.capture_frame()
+    recorder.add_hold(2.0)
+    return False
+
+
 def main():
     case_config = load_case_config()
     vlm_goal = case_config["language_goal"]
@@ -2526,6 +2608,7 @@ def main():
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             attempts_started = attempt
+            attempt_reward_settled = False
 
             print()
             print("=" * 60)
@@ -3475,28 +3558,27 @@ def main():
             )
 
             # ---------------------------------------------------------
-            # IK FAILURE RECOVERY (JOINT_POSITION ONLY)
+            # EXECUTION FAILURE RECOVERY
             #
-            # If the selected grasp is not IK-converged / executable,
-            # reject this perception cycle, return to the saved home joint
-            # configuration using q_ref + JOINT_POSITION, then re-perceive.
+            # Any recoverable execution-layer failure uses the same policy:
+            # settle this attempt once, open the gripper at the current
+            # configuration, return home with an open gripper, then either
+            # re-perceive or terminate if home recovery itself fails.
             # ---------------------------------------------------------
             if not bool(execution.get("success", False)):
                 failed_phase = execution.get("failed_phase")
 
-                reward = -1.0
-                episode_reward += reward
-
-                print(
-                    f"Reward: {reward:+.4f} "
-                    f"(grasp execution failed), "
-                    f"episode_reward={episode_reward:+.4f}"
+                episode_reward, attempt_reward_settled = (
+                    settle_attempt_reward(
+                        -1.0,
+                        f"no task evaluator: execution failed in {failed_phase}",
+                        episode_reward,
+                        attempt_reward_settled,
+                    )
                 )
 
                 print()
-                print("#" * 70)
-                print("IK EXECUTION FAILED — RECOVERING HOME")
-                print("#" * 70)
+                print("Execution failed before task evaluation.")
                 print("Failed phase:", failed_phase)
 
                 # Diagnostic only: expose why the selected pregrasp IK was
@@ -3574,55 +3656,13 @@ def main():
                                 ),
                             )
 
-                # Recovery policy:
-                #   - if lift IK fails after the gripper has closed, release
-                #     the object immediately at the current pose, then return
-                #     home with an open gripper;
-                #   - failures before lift return home with the gripper open.
-                if failed_phase == "lift":
-                    print(
-                        "Lift failed after gripper close. "
-                        "Releasing object at current pose before return-home."
-                    )
-                    env.open_gripper(steps=30)
-                    recorder.capture_frame()
-                    recorder.add_hold(0.5)
-
-                recovery_result = env.move_joints_qref(
-                    target_joint_positions=home_joint_positions,
-                    gripper_command=-1.0,
-                    stop_on_table_contact=False,
-                    frame_callback=(
-                        lambda _env: recorder.capture_frame()
-                    ),
-                    frame_capture_interval=IK_VIDEO_PHYSICS_CAPTURE_INTERVAL,
-                )
-
-                print(
-                    "IK/q_ref return-home success:",
-                    recovery_result["success"],
-                )
-                print(
-                    "IK/q_ref return-home failure reason:",
-                    recovery_result["failure_reason"],
-                )
-
-                if recovery_result["success"]:
-                    env.open_gripper(steps=30)
-                    recorder.capture_frame()
-                    recorder.add_hold(0.5)
-
-                    print(
-                        "Recovery complete. Starting a new perception / "
-                        "planning cycle."
-                    )
+                if recover_open_gripper_home(
+                    env,
+                    recorder,
+                    home_joint_positions,
+                    f"execution failed in {failed_phase}",
+                ):
                     continue
-
-                print(
-                    "Return-home recovery failed. Stopping this run."
-                )
-                recorder.capture_frame()
-                recorder.add_hold(2.0)
                 break
 
             # =========================================================
@@ -3694,7 +3734,6 @@ def main():
                         )
 
             # Physical grasp failed: no object is retained by the gripper.
-            # Recovery uses JOINT_POSITION only.
             if not gripper_holds_something:
                 print()
                 print(
@@ -3702,46 +3741,23 @@ def main():
                     "that no object is being held."
                 )
 
-                reward = -1.0
-                episode_reward += reward
-
-                print(
-                    f"Reward: {reward:+.4f} "
-                    f"(empty grasp), "
-                    f"episode_reward={episode_reward:+.4f}"
-                )
-
-                recovery_result = env.move_joints_qref(
-                    target_joint_positions=home_joint_positions,
-                    gripper_command=-1.0,
-                    stop_on_table_contact=False,
-                    frame_callback=(
-                        lambda _env: recorder.capture_frame()
-                    ),
-                    frame_capture_interval=(
-                        IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
-                    ),
-                )
-
-                print(
-                    "JOINT_POSITION return home after empty grasp success:",
-                    recovery_result["success"],
-                )
-
-                if not recovery_result["success"]:
-                    print(
-                        "Return-home recovery failed. Stopping this run."
+                episode_reward, attempt_reward_settled = (
+                    settle_attempt_reward(
+                        -1.0,
+                        "no task evaluator: empty grasp",
+                        episode_reward,
+                        attempt_reward_settled,
                     )
-                    break
-
-                env.open_gripper(steps=30)
-                recorder.capture_frame()
-                recorder.add_hold(0.5)
-
-                print(
-                    "Home reached. Re-perceiving the current scene."
                 )
-                continue
+
+                if recover_open_gripper_home(
+                    env,
+                    recorder,
+                    home_joint_positions,
+                    "empty grasp",
+                ):
+                    continue
+                break
 
             # PyBullet-style grasped-object identification after lift.
             grasped_obj_id = None
@@ -3813,14 +3829,22 @@ def main():
                     "Fixed drop-joint transport failed."
                 )
 
-                reward = -1.0
-                episode_reward += reward
-
-                print(
-                    f"Reward: {reward:+.4f} "
-                    f"(transport failed), "
-                    f"episode_reward={episode_reward:+.4f}"
+                episode_reward, attempt_reward_settled = (
+                    settle_attempt_reward(
+                        -1.0,
+                        "no task evaluator: fixed transport failed",
+                        episode_reward,
+                        attempt_reward_settled,
+                    )
                 )
+
+                if recover_open_gripper_home(
+                    env,
+                    recorder,
+                    home_joint_positions,
+                    "fixed transport failed",
+                ):
+                    continue
                 break
 
             # ---------------------------------------------------------
@@ -3844,58 +3868,23 @@ def main():
                     "without issuing an intentional bin-release command."
                 )
 
-                reward = -1.0
-                episode_reward += reward
-
-                print(
-                    f"Reward: {reward:+.4f} "
-                    f"(object lost during transport), "
-                    f"episode_reward={episode_reward:+.4f}"
+                episode_reward, attempt_reward_settled = (
+                    settle_attempt_reward(
+                        -1.0,
+                        "no task evaluator: object lost during transport",
+                        episode_reward,
+                        attempt_reward_settled,
+                    )
                 )
 
-                return_home_result = env.move_joints_qref(
-                    target_joint_positions=home_joint_positions,
-                    gripper_command=-1.0,
-                    stop_on_table_contact=False,
-                    frame_callback=(
-                        lambda _env: recorder.capture_frame()
-                    ),
-                    frame_capture_interval=(
-                        IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
-                    ),
-                )
-
-                print(
-                    "JOINT_POSITION return home after transport loss:",
-                    return_home_result["success"],
-                )
-
-                if not return_home_result["success"]:
-                    break
-
-                env.open_gripper(steps=30)
-                recorder.capture_frame()
-                recorder.add_hold(0.5)
-
-                print(
-                    "Home reached after transport loss. Re-perceiving."
-                )
-                continue
-
-            if grasped_obj_id == target_body_id:
-                reward = 2.0
-                reward_reason = "correct target"
-            else:
-                reward = -pos_dist / max_pos_dist
-                reward_reason = f"wrong object: {grasped_obj_name}"
-
-            episode_reward += reward
-
-            print(
-                f"Reward: {reward:+.4f} "
-                f"({reward_reason}), "
-                f"episode_reward={episode_reward:+.4f}"
-            )
+                if recover_open_gripper_home(
+                    env,
+                    recorder,
+                    home_joint_positions,
+                    "object lost during transport",
+                ):
+                    continue
+                break
 
             # Physical transport succeeded. Release the held object in the bin.
             open_result = env.open_gripper(steps=40)
@@ -3927,7 +3916,16 @@ def main():
 
             if not return_home_result["success"]:
                 print(
-                    "Return home after release failed; stopping this run."
+                    "Return home after release failed before task evaluation."
+                )
+
+                episode_reward, attempt_reward_settled = (
+                    settle_attempt_reward(
+                        -1.0,
+                        "no task evaluator: return home after release failed",
+                        episode_reward,
+                        attempt_reward_settled,
+                    )
                 )
                 break
 
@@ -3961,12 +3959,30 @@ def main():
             )
 
             if target_inside_bin:
+                episode_reward, attempt_reward_settled = (
+                    settle_attempt_reward(
+                        2.0,
+                        "correct target inside bin",
+                        episode_reward,
+                        attempt_reward_settled,
+                    )
+                )
+
                 target_completed = True
                 print(
                     f"Target {target_object} is inside the bin. "
                     "Closed-loop task completed."
                 )
                 break
+
+            episode_reward, attempt_reward_settled = (
+                settle_attempt_reward(
+                    -pos_dist / max_pos_dist,
+                    f"task evaluator reached: wrong object {grasped_obj_name}",
+                    episode_reward,
+                    attempt_reward_settled,
+                )
+            )
 
             print(
                 f"Target {target_object} is not inside the bin. "

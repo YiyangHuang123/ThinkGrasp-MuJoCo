@@ -507,26 +507,25 @@ force-stop persistence: 5 consecutive physics steps
 
 IK uses continuity-first seed selection: the current / previous waypoint joint state is preferred whenever it is already practically acceptable, and deterministic multi-start solutions are used only as fallback.
 
-The gripper closes until its width becomes stable, with an 80-control-step maximum.
+The grasp descent force-stop is a contact-triggered early stop, not an execution failure. When the monitored end-effector force remains above the threshold for the persistence window, the descent stops and the runner proceeds to gripper closing from the current configuration.
 
-If lift IK fails after the gripper has already closed, the object is released at the current pose before the Panda returns home. Failures before lift recover home with the gripper open.
+The gripper closes until its width becomes stable, with an 80-control-step maximum. Stable gripper width only ends the closing command; it is not treated as grasp success. Physical holding is checked separately from the measured gripper width after closing and again before bin release.
+
+All recoverable execution-layer failures use one recovery rule: open the gripper at the current configuration, return to the saved home joint configuration with an open gripper, and then start a new perception/planning cycle. This covers pregrasp, approach, and lift IK or motion failure, empty grasp, fixed transport failure, and object loss during transport. If the return-home recovery itself fails, the current run is terminated.
 
 After a successful lift, the held object is transported with a fixed Panda joint-space drop posture rather than a separate bin-target IK stage.
 
 ## Reward and Task Evaluation
 
-The runner keeps physical grasp success, reward, and final task success as separate concepts.
-
-Current reward bookkeeping follows the original ThinkGrasp-style semantics:
-
+The runner keeps physical grasp success, attempt reward, recovery, and final task success as separate concepts. Each execution attempt settles reward at most once:
 ```text
-empty grasp / execution or transport failure:  -1
-correct target grasp and transport:             +2
-wrong object grasp:
+correct target finally inside the bin:            +2
+reached task evaluator but processed wrong object:
     - distance(actual grasped object, target) / workspace XY diagonal
+failed before reaching task evaluator:            -1
 ```
 
-After lift, the actually grasped object is inferred from simulator object state. Final task completion is evaluated after release and return-home by checking whether the ground-truth target body lies inside the receiving-bin XY footprint.
+After lift, the actually grasped object is inferred from simulator object state. Final task completion and the positive reward are evaluated after release and return-home by checking whether the ground-truth target body lies inside the receiving-bin XY footprint.
 
 The accumulated value is printed as:
 
@@ -639,7 +638,7 @@ Current implemented / validated components include:
 - stable-width gripper closing
 - fixed joint-space transport
 - simulator-side reward and task-success evaluation
-- lift-failure release-before-home recovery
+- unified open-gripper return-home recovery for recoverable execution failures
 - retry-based closed-loop execution
 - grasp / perception debugging outputs
 - project-local native extension build workflow
