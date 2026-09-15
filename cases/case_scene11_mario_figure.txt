@@ -1,0 +1,2 @@
+Please pick up the Mario figure.
+mario_figure

@@ -1,647 +1,331 @@
 # ThinkGrasp-MuJoCo
 
-A MuJoCo-based closed-loop robotic grasping system developed from the ThinkGrasp codebase and task formulation.
+A MuJoCo-based experimental platform for language-guided target grasping in cluttered scenes.
 
-This work started from ThinkGrasp, but the current implementation has been substantially modified for the MuJoCo-based system developed in this project. Major changes include the simulation backend, Franka Panda control stack, perception and weighted grasp-candidate ranking, closed-loop execution logic, and multi-scene evaluation framework. The current simulator uses a Franka Emika Panda with the Franka Hand.
+The project investigates how a vision-language model (VLM) can assist target localization, grasp selection, and closed-loop manipulation.
 
-## Pipeline
+## Main Features
 
-The current formal closed-loop pipeline is:
+- VLM-based target selection and visual description
+- VLM centroid prediction for spatial guidance
+- GroundingDINO open-vocabulary candidate generation
+- Centroid-guided target localization
+- GraspNet 6-DoF grasp generation
+- Geometry-only grasp selection
+- VLM-only grasp selection
+- VLM-guided grasp selection
+- Closed-loop execution with scene re-perception
+- Robot recovery and replanning
+- Paired full-versus-baseline evaluation using the same MuJoCo scene state
 
-```text
-Natural-language task
-    ↓
-MuJoCo RGB-D perception
-    ↓
-Qwen3-VL target selection
-    ↓
-GroundingDINO target localization
-    ↓
-GraspNet grasp proposal generation
-    ↓
-GroundingDINO target-region grasp filtering
-    ↓
-weighted grasp ranking
-(angle quality + VLM preferred location)
-    ↓
-Panda inverse kinematics
-    ↓
-JOINT_POSITION / q_ref execution
-    ↓
-grasp → lift → fixed joint-space transport → release
-    ↓
-simulator-side task evaluation
-    ↓
-re-perception / re-planning if necessary
-```
-
-If the selected target region contains no usable grasp, the runner performs a four-view full-scene fallback. The fallback is intentionally target-agnostic and is used only to perturb the clutter before the next perception cycle.
-
-The formal grasp-control path is:
+## System Pipeline
 
 ```text
-GraspNet 7D grasp pose
-→ Panda grip-site target pose
-→ inverse kinematics
-→ 7 Panda joint targets
-→ JOINT_POSITION / q_ref control
+Language instruction + scene image
+                |
+                v
+              VLM
+                |
+                +-- visual description
+                +-- object centroid
+                +-- preferred grasp region
+                |
+                v
+         GroundingDINO localization
+                |
+                v
+         GraspNet grasp generation
+                |
+                v
+          Grasp candidate ranking
+                |
+                v
+       MuJoCo robot execution
+                |
+                v
+       Re-perception and replanning
 ```
 
-OSC compatibility utilities remain in `thinkgrasp_minimal_env.py`, but OSC is not used by the formal closed-loop grasp execution path.
+## Main Components
 
-## Current Grasp-Selection Policy
+### Core Runtime
 
-GroundingDINO detections are ranked with a soft combination of detector confidence and VLM centroid proximity:
+- `run_closed_loop.py`  
+  Main closed-loop execution script.
 
-```text
-0.70 × GroundingDINO confidence
-+ 0.30 × VLM-centroid proximity score
-```
+- `thinkgrasp_minimal_env.py`  
+  MuJoCo and robosuite environment definition.
 
-Inside the selected GroundingDINO target region, the normal grasp selector uses:
+- `scene_bridge.py`  
+  Scene and point-cloud data exchange.
 
-```text
-0.60 × approach-angle score
-+ 0.40 × preferred-location score
-```
+- `vlm_bridge.py`  
+  Interface between the VLM and the manipulation pipeline.
 
-No hard approach-angle threshold is applied in normal target-grasp selection. GraspNet confidence is diagnostic in this mode.
+- `grasp_detector.py`  
+  Grasp candidate processing and ranking.
 
-When the target region contains zero usable grasps, the full-scene fallback uses:
+- `graspnet_bridge.py`  
+  GraspNet inference interface.
 
-```text
-0.60 × approach-angle score
-+ 0.40 × GraspNet confidence
-```
+- `graspnet_config.py`  
+  GraspNet-related configuration.
 
-The VLM preferred location is intentionally ignored in fallback mode.
+- `dual_view_recorder.py`  
+  Execution video recording.
 
-## Repository Structure
+### Perception
 
-```text
-.
-├── run_closed_loop.py
-├── thinkgrasp_minimal_env.py
-├── scene_bridge.py
-├── vlm_bridge.py
-├── graspnet_bridge.py
-├── graspnet_config.py
-├── grasp_detector.py
-├── run_graspnet_inference.py
-├── run_groundingdino_inference.py
-├── run_pointcloud_fusion.py
-├── pybullet_pointcloud_fusion.py
-├── perception_viz.py
-├── dual_view_recorder.py
-├── vlm_system_prompt.txt
-│
-├── cases/
-├── assets/
-│   └── scanned_objects/
-│       ├── models/
-│       └── robosuite_adapters/        # generated locally
-├── models/
-│   └── graspnet/
-├── scripts/
-│   ├── build_native_extensions.sh
-│   ├── setup_runtime_env.sh
-│   └── validate_installation.py
-└── third_party/
-    └── GroundingDINO/
-```
+- `run_groundingdino_inference.py`  
+  GroundingDINO inference.
 
-Runtime outputs, videos, logs, compiled extensions, model checkpoints, development archives, local milestone snapshots, and generated robosuite adapter XML files are excluded from Git.
+- `run_pointcloud_fusion.py`  
+  Point-cloud fusion.
 
-## Python Environments
+- `pybullet_pointcloud_fusion.py`  
+  Point-cloud reconstruction utilities.
 
-The project uses two execution environments, plus a separate environment for serving the VLM when vLLM is used.
+- `perception_viz.py`  
+  Perception and grasp visualization.
 
-### 1. MuJoCo main environment
+- `run_graspnet_inference.py`  
+  Standalone GraspNet inference.
 
-Validated environment:
+### Experiments
 
-```text
-Python      3.10.20
-NumPy       2.2.6
-SciPy       1.15.3
-MuJoCo      3.3.7
-robosuite   1.5.2
-openai      2.53.0
-```
+- `run_end_to_end_comparison.py`  
+  Paired full-versus-baseline evaluation.
 
-This environment runs:
+- `run_closed_loop_batch.py`  
+  Batch closed-loop evaluation.
 
-- MuJoCo / robosuite simulation
-- Panda control
-- scene generation
-- VLM API communication
-- closed-loop execution
+- `run_grasp_selection_evaluation.py`  
+  Geometry-only, VLM-only, and VLM-guided grasp-selection evaluation.
 
-Open3D is not required in the main MuJoCo environment.
+- `run_grasp_selection_batch.py`  
+  Batch grasp-selection evaluation.
 
-### 2. Legacy perception / GraspNet environment
+- `run_localization_comparison.py`  
+  VLM-prompt DINO and VLM-guided DINO comparison.
 
-Validated environment:
+- `run_localization_evaluation.py`  
+  Localization evaluation.
 
-```text
-Python          3.8.20
-NumPy           1.23.5
-PyTorch         1.13.1+cu117
-torchvision     0.14.1+cu117
-Open3D          0.15.2
-Transformers    4.46.3
-timm            1.0.28
-huggingface_hub 0.36.2
-```
+- `run_vlm_language_check.py`  
+  VLM language and clutter-awareness capability checks.
 
-This environment is used through subprocesses for:
+- `collect_scene11_localization_cases.py`  
+  Scene generation for localization experiments.
 
+## Environment
+
+The system was developed and tested with:
+
+- Python 3.10
+- MuJoCo
+- robosuite
+- PyTorch
 - GroundingDINO
-- source-style point-cloud fusion
 - GraspNet
+- Qwen3-VL
 
-The MuJoCo process and legacy perception workers are intentionally kept separate.
+The exact package versions depend on the local Conda environment.
 
-## Required Environment Variables
+## Case Files
 
-Before building native extensions or running the closed loop, define the Python interpreter used by the legacy perception workers:
+Case configurations are stored in the `cases/` directory.
 
-```bash
-export LEGACY_PERCEPTION_PYTHON=/path/to/legacy/python3.8
-```
-
-GraspNet can use the same interpreter:
-
-```bash
-export GRASPNET_PYTHON="$LEGACY_PERCEPTION_PYTHON"
-```
-
-If a separate GraspNet environment is used:
-
-```bash
-export GRASPNET_PYTHON=/path/to/graspnet/python
-```
-
-For native extension compilation, also define a CUDA toolkit compatible with the PyTorch version installed in the legacy perception environment:
-
-```bash
-export CUDA_HOME=/path/to/compatible/cuda/toolkit
-```
-
-Do not assume that the system-wide CUDA toolkit is compatible with the legacy PyTorch build.
-
-## Native CUDA Extensions
-
-GroundingDINO, PointNet2, and KNN require compiled native extensions.
-
-Build them with:
-
-```bash
-bash scripts/build_native_extensions.sh
-```
-
-The PointNet2 and KNN runtime packages are copied into:
+Examples include:
 
 ```text
-.native_runtime/
+cases/case_scene01_white_ramekin.txt
+cases/case_scene11_white_ramekin.txt
+cases/case_scene11_gaming_mouse.txt
+cases/case_scene11_mario_figure.txt
 ```
 
-This directory is generated locally and excluded from Git.
-
-GroundingDINO is built in place under:
+VLM capability-check cases and images are stored in:
 
 ```text
-third_party/GroundingDINO/
+cases/vlm_language_cases/
 ```
 
-## VLM
+## Running the Closed-Loop System
 
-The current VLM is:
-
-```text
-Qwen/Qwen3-VL-4B-Instruct
-```
-
-`vlm_bridge.py` communicates with an OpenAI-compatible API endpoint.
-
-A validated deployment uses vLLM. Prepare a vLLM environment and local model directory:
-
-```bash
-export QWEN_ENV=/path/to/qwen_vllm_environment
-export QWEN_MODEL_PATH=/path/to/Qwen3-VL-4B-Instruct
-```
-
-Start the service in a dedicated terminal:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 \
-"$QWEN_ENV/bin/vllm" serve \
-"$QWEN_MODEL_PATH" \
-  --served-model-name Qwen/Qwen3-VL-4B-Instruct \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --gpu-memory-utilization 0.75 \
-  --max-model-len 4096 \
-  --dtype bfloat16
-```
-
-The GPU index and memory utilization may be adjusted for the target machine.
-
-Configure the ThinkGrasp-MuJoCo client:
-
-```bash
-export VLM_BASE_URL=http://127.0.0.1:8000/v1
-export VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct
-export OPENAI_API_KEY=EMPTY
-```
-
-Verify the endpoint:
-
-```bash
-curl -s http://127.0.0.1:8000/v1/models
-```
-
-The ThinkGrasp-style system prompt is stored locally in:
-
-```text
-vlm_system_prompt.txt
-```
-
-## GroundingDINO
-
-GroundingDINO source code is stored under:
-
-```text
-third_party/GroundingDINO/
-```
-
-`run_groundingdino_inference.py` therefore does not require the original parent ThinkGrasp repository at runtime.
-
-The current worker requests:
-
-```text
-GroundingDINO_SwinB.cfg.py
-groundingdino_swinb_cogcoor.pth
-```
-
-`run_groundingdino_inference.py` obtains these files through the Hugging Face Hub and reuses the local Hugging Face cache on later runs. The first run therefore requires network access unless the required files are already present in the cache.
-
-GroundingDINO receives a high-resolution RAW top-view crop derived from the configured world workspace. The crop is computed from RAW per-pixel world coordinates rather than from a fixed image-space rectangle.
-
-## GraspNet
-
-The project-local GraspNet source is stored under:
-
-```text
-models/graspnet/
-```
-
-The checkpoint is intentionally excluded from Git. Place it at:
-
-```text
-models/graspnet/logs/log_rs/checkpoint.tar
-```
-
-The project configuration is stored in:
-
-```text
-graspnet_config.py
-```
-
-GraspNet itself receives point clouds without semantic text input. Target-specific filtering and final ranking are performed after grasp generation by the MuJoCo closed-loop runner.
-
-## MuJoCo Scenes and GSO Assets
-
-The evaluation setup contains 10 fixed five-object clutter scenes. Together they use 50 scene-object slots and 49 unique Google Scanned Object model directories because `BUNNY_RACER` is intentionally reused in Scene02 and Scene09.
-
-The robot, table, cameras, workspace, clutter-drop procedure, bin, controller, reward logic, and closed-loop task logic remain shared across the scenes; only the selected five-object set changes.
-
-| Scene | Object aliases | Fixed default target |
-| --- | --- | --- |
-| scene01 | coffee_mug, ecoforms_cup, circo_holder, **white_ramekin**, ink_cartridge | `white_ramekin` |
-| scene02 | black_bowl, nesquik_canister, crayon_box, **nikon_camera**, bunny_racer | `nikon_camera` |
-| scene03 | white_cereal_bowl, latte_box, green_speaker, **mario_figure**, can_opener | `mario_figure` |
-| scene04 | turquoise_bowl, fondant_box, blue_bottle, **baby_car**, alarm_clock | `baby_car` |
-| scene05 | yellow_blue_bowl, mocha_box, **gaming_mouse**, yoshi_figure, black_ink_box | `gaming_mouse` |
-| scene06 | quercetin_bottle, cookie_candy_box, fire_truck, **moisturizer_jar**, pencil_case | `moisturizer_jar` |
-| scene07 | probiotic_bottle, snack_dispenser, **rhino_figure**, color_ink_box, hard_drive | `rhino_figure` |
-| scene08 | **creatine_bottle**, fujifilm_camera_box, speed_boat, face_moisturizer, peanut_butter_candy_box | `creatine_bottle` |
-| scene09 | neck_cream_jar, **lion_figure**, soap_dish, pink_rubber_toy, bunny_racer | `lion_figure` |
-| scene10 | borage_bottle, toy_airplane, game_case, **crocodile_toy**, cleanser_bottle | `crocodile_toy` |
-
-The complete alias-to-GSO-directory mapping is defined in:
-
-```text
-GSO_SCENE_OBJECT_SPECS
-```
-
-inside `thinkgrasp_minimal_env.py`.
-
-Only the GSO source model directories referenced by these 10 scenes are intended to be tracked by this repository. The remaining scanned-object dataset is ignored by `.gitignore`.
-
-At runtime, `thinkgrasp_minimal_env.py` generates robosuite-compatible adapter XML files under:
-
-```text
-assets/scanned_objects/robosuite_adapters/
-```
-
-These adapters are derived from the tracked GSO source models and are excluded from Git.
-
-The original scanned-object dataset metadata and license files remain under:
-
-```text
-assets/scanned_objects/
-```
-
-## Headless MuJoCo
-
-For a headless server using OSMesa:
-
-```bash
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
-```
-
-These are also the defaults used by:
-
-```bash
-source scripts/setup_runtime_env.sh
-```
-
-## Runtime Environment Setup
-
-After the native extensions have been built, configure the runtime environment.
-
-First define machine-specific interpreter paths:
-
-```bash
-export LEGACY_PERCEPTION_PYTHON=/path/to/legacy/python3.8
-export GRASPNET_PYTHON="$LEGACY_PERCEPTION_PYTHON"
-```
-
-Then source:
-
-```bash
-source scripts/setup_runtime_env.sh
-```
-
-The script configures:
-
-```text
-PROJECT_ROOT
-PYTHONPATH
-MUJOCO_GL
-PYOPENGL_PLATFORM
-VLM_BASE_URL
-VLM_MODEL
-OPENAI_API_KEY
-GRASPNET_PYTHON
-```
-
-Machine-specific absolute paths are intentionally not stored in the repository.
-
-## Installation Validation
-
-Before running the full closed loop, validate the installation:
-
-```bash
-python scripts/validate_installation.py
-```
-
-The validator is intended to catch missing core runtime dependencies before a long closed-loop run. It also reads `GSO_SCENE_OBJECT_SPECS` directly and validates the assets used by all 10 configured scenes: 50 scene-object slots, 49 unique GSO model directories, each model XML, and the external mesh / texture files referenced by those XML files.
-
-A robosuite warning about the optional Mink-based whole-body IK controller for GR1 may appear during import. The current Panda pipeline uses its own IK and JOINT_POSITION path and does not rely on that GR1 controller.
-
-## Running the Closed Loop
-
-The normal interface selects a scene number. The runner automatically resolves that scene to its fixed default case:
-
-```bash
-python run_closed_loop.py --scene 1
-```
-
-For example:
-
-```bash
-python run_closed_loop.py --scene 5
-```
-
-resolves to:
-
-```text
-scene05
-→ cases/case_scene05_gaming_mouse.txt
-→ target: gaming_mouse
-```
-
-Both numeric and canonical scene names are accepted:
-
-```bash
-python run_closed_loop.py --scene 5
-python run_closed_loop.py --scene scene05
-```
-
-If `--scene` is omitted, Scene01 is used.
-
-A case can still be supplied explicitly as a manual override:
+Example:
 
 ```bash
 python run_closed_loop.py \
-  --scene 5 \
-  --case cases/case_scene05_gaming_mouse.txt
+  --scene scene11 \
+  --case cases/case_scene11_white_ramekin.txt
 ```
 
-A case file contains at least two lines:
+The default configuration runs the full VLM-guided pipeline.
 
-```text
-natural-language grasp instruction
-MuJoCo ground-truth target object name
-```
+## Running the Baseline
 
-For example:
+The baseline uses:
 
-```text
-Pick up the white ramekin and place it in the bin.
-white_ramekin
-```
+- the original target description;
+- the highest-confidence GroundingDINO candidate;
+- geometry-only grasp selection.
 
-The natural-language instruction is used by the VLM / GroundingDINO / grasp-planning pipeline.
-
-The simulator ground-truth target name is not used to pre-filter VLM, GroundingDINO, or GraspNet predictions. It is used for simulator-side task evaluation and reward bookkeeping.
-
-A minimal workflow is:
+Example:
 
 ```bash
-# 1. Activate the MuJoCo environment.
-conda activate /path/to/thinkgrasp_mujoco
-
-# 2. Define the legacy perception worker.
-export LEGACY_PERCEPTION_PYTHON=/path/to/legacy/python3.8
-export GRASPNET_PYTHON="$LEGACY_PERCEPTION_PYTHON"
-
-# 3. Configure project-local runtime paths and defaults.
-source scripts/setup_runtime_env.sh
-
-# 4. Validate the installation and VLM endpoint.
-python scripts/validate_installation.py
-
-# 5. Run one fixed evaluation scene.
-python run_closed_loop.py --scene 1
+python run_closed_loop.py \
+  --scene scene11 \
+  --case cases/case_scene11_white_ramekin.txt \
+  --evaluation-mode baseline
 ```
 
-The Qwen vLLM service must already be running in a separate terminal.
+## Paired End-to-End Evaluation
 
-## Formal Execution Behavior
+The paired evaluation runs the full and baseline configurations on the same initial MuJoCo scene state.
 
-The current closed-loop execution uses:
+Example:
+
+```bash
+python run_end_to_end_comparison.py \
+  --scene scene11 \
+  --case cases/case_scene11_white_ramekin.txt \
+  --count 15 \
+  --max-attempts 15 \
+  --output-dir end_to_end_evaluation_paired15
+```
+
+For each trial:
 
 ```text
-pregrasp height:        0.20 m in world +Z
-lift height:            0.20 m in world +Z
-grasp depth offset:     0.0 m
-Cartesian waypoint:     0.01 m
-q_ref speed:            1.0 rad/s
-force-stop threshold:   15.0
-force-stop persistence: 5 consecutive physics steps
+1. Generate one MuJoCo scene.
+2. Save its initial state.
+3. Run the full VLM-guided configuration.
+4. Restore the saved state.
+5. Run the baseline configuration.
 ```
 
-IK uses continuity-first seed selection: the current / previous waypoint joint state is preferred whenever it is already practically acceptable, and deterministic multi-start solutions are used only as fallback.
-
-The grasp descent force-stop is a contact-triggered early stop, not an execution failure. When the monitored end-effector force remains above the threshold for the persistence window, the descent stops and the runner proceeds to gripper closing from the current configuration.
-
-The gripper closes until its width becomes stable, with an 80-control-step maximum. Stable gripper width only ends the closing command; it is not treated as grasp success. Physical holding is checked separately from the measured gripper width after closing and again before bin release.
-
-All recoverable execution-layer failures use one recovery rule: open the gripper at the current configuration, return to the saved home joint configuration with an open gripper, and then start a new perception/planning cycle. This covers pregrasp, approach, and lift IK or motion failure, empty grasp, fixed transport failure, and object loss during transport. If the return-home recovery itself fails, the current run is terminated.
-
-After a successful lift, the held object is transported with a fixed Panda joint-space drop posture rather than a separate bin-target IK stage.
-
-## Reward and Task Evaluation
-
-The runner keeps physical grasp success, attempt reward, recovery, and final task success as separate concepts. Each execution attempt settles reward at most once:
-```text
-correct target finally inside the bin:            +2
-reached task evaluator but processed wrong object:
-    - distance(actual grasped object, target) / workspace XY diagonal
-failed before reaching task evaluator:            -1
-```
-
-After lift, the actually grasped object is inferred from simulator object state. Final task completion and the positive reward are evaluated after release and return-home by checking whether the ground-truth target body lies inside the receiving-bin XY footprint.
-
-The accumulated value is printed as:
+The paired scene states are stored under:
 
 ```text
-Final episode reward
+paired_scene_states/
 ```
 
-## Recommended Setup Order
+## Grasp-Selection Evaluation
+
+The grasp-selection evaluation generates grasp candidates and exports the selected grasp results without executing the complete task.
+
+Example:
+
+```bash
+python run_grasp_selection_evaluation.py \
+  --scene scene11 \
+  --case cases/case_scene11_mario_figure.txt
+```
+
+The generated files may include:
+
+- all grasp candidates;
+- target-region point cloud;
+- geometry-only selected grasp;
+- VLM-guided selected grasp;
+- VLM-only selected grasp;
+- comparison metadata.
+
+## Localization Evaluation
+
+Example:
+
+```bash
+python run_localization_comparison.py \
+  --scene scene11 \
+  --case cases/case_scene11_white_ramekin.txt
+```
+
+The localization comparison evaluates:
+
+- VLM-prompt DINO;
+- VLM-guided DINO.
+
+The guided configuration combines GroundingDINO confidence with the VLM-predicted centroid.
+
+## VLM Capability Checks
+
+The capability-check cases are located at:
 
 ```text
-Clone repository
-    ↓
-Create / activate MuJoCo main environment
-    ↓
-Prepare legacy perception / GraspNet environment
-    ↓
-Set LEGACY_PERCEPTION_PYTHON and CUDA_HOME
-    ↓
-Build native extensions
-    ↓
-Place GraspNet checkpoint
-    ↓
-Prepare and start Qwen3-VL with vLLM
-    ↓
-Source scripts/setup_runtime_env.sh
-    ↓
-Run scripts/validate_installation.py
-    ↓
-Run run_closed_loop.py --scene <1..10>
+cases/vlm_language_cases/
 ```
 
-## Runtime Outputs
+They include:
 
-Runtime artifacts are generated under directories such as:
+- direct language-based target selection;
+- indirect language understanding;
+- clutter-aware object selection;
+- obstruction removal reasoning.
+
+## Scene Configuration
+
+The project contains multiple fixed MuJoCo object sets.
+
+Examples:
+
+- `scene01`: less cluttered configuration;
+- `scene11`: highly cluttered configuration.
+
+The scene configuration is defined in:
+
+```text
+thinkgrasp_minimal_env.py
+```
+
+The target object and language instruction are defined in the corresponding case file.
+
+## Output Management
+
+Generated runtime outputs are intentionally excluded from Git.
+
+Examples include:
 
 ```text
 bridge_data/
 closed_loop_outputs/
+localization_evaluation/
+grasp_selection_evaluation/
 grasp_videos/
+vlm_capability_outputs/
+workspace_preview/
+end_to_end_evaluation*/
+end_to_end_test*/
 ```
 
-`closed_loop_outputs/` contains human-readable debugging artifacts such as VLM-selection images, GroundingDINO candidate grids, fused-cloud previews, perception views, grasp visualizations, and logs.
+Generated logs, videos, point clouds, temporary files, and MuJoCo state files are also excluded.
 
-Generated NPZ files, PLY files, images, videos, logs, compiled extensions, and other runtime artifacts are excluded from Git.
+## Reproducibility Notes
 
-## ThinkGrasp Origin and Citation
+For paired comparisons, the same initial MuJoCo state must be used by both configurations.
 
-This repository started from the ThinkGrasp codebase and task formulation, but the current implementation has been substantially modified. The main changes in this project cover the MuJoCo simulation backend, Franka Panda IK + joint-position control, perception and weighted grasp ranking, closed-loop recovery / fallback behavior, and multi-scene evaluation.
+The paired evaluation therefore saves:
 
-Original ThinkGrasp project:
+- MuJoCo joint positions;
+- MuJoCo joint velocities;
+- simulation state information.
 
-- Paper: *ThinkGrasp: A Vision-Language System for Strategic Part Grasping in Clutter*
-- Authors: Yaoyao Qian, Xupeng Zhu, Ondrej Biza, Shuo Jiang, Linfeng Zhao, Haojie Huang, Yu Qi, Robert Platt
-- Official code: https://github.com/H-Freax/ThinkGrasp
-- Proceedings: https://proceedings.mlr.press/v270/qian25c.html
-
-If you use the ThinkGrasp-derived parts of this repository, please cite the original work:
-
-```bibtex
-@InProceedings{pmlr-v270-qian25c,
-  title     = {ThinkGrasp: A Vision-Language System for Strategic Part Grasping in Clutter},
-  author    = {Qian, Yaoyao and Zhu, Xupeng and Biza, Ondrej and Jiang, Shuo and Zhao, Linfeng and Huang, Haojie and Qi, Yu and Platt, Robert},
-  booktitle = {Proceedings of The 8th Conference on Robot Learning},
-  pages     = {3568--3586},
-  year      = {2025},
-  volume    = {270},
-  series    = {Proceedings of Machine Learning Research},
-  publisher = {PMLR}
-}
-```
+The baseline restores this state before execution instead of using a newly generated random scene.
 
 ## Third-Party Components
 
-This repository contains project-local copies or subsets of third-party components used by the ThinkGrasp pipeline.
+This project uses third-party components including:
 
-Please refer to the corresponding license and README files:
+- robosuite;
+- MuJoCo;
+- GroundingDINO;
+- GraspNet;
+- PyTorch;
+- scanned-object assets;
+- external model checkpoints.
 
-```text
-models/graspnet/LICENSE
-models/graspnet/README.md
+Please check the licenses of all third-party software, models, datasets, and scanned objects before redistribution.
 
-third_party/GroundingDINO/LICENSE
-third_party/GroundingDINO/README.md
+## License
 
-assets/scanned_objects/LICENSE
-assets/scanned_objects/README.md
-assets/scanned_objects/VERSION
-```
-
-These components remain subject to their respective upstream licenses and terms. The original ThinkGrasp codebase is also distributed under its upstream license; a repository-level license for this modified project should not be interpreted as replacing the licenses of bundled third-party components.
-
-## Project Status
-
-Current implemented / validated components include:
-
-- MuJoCo Panda + Franka Hand scene
-- 10 fixed five-object GSO clutter scenes
-- RGB-D perception and calibrated world workspace
-- high-resolution RAW workspace crop for GroundingDINO
-- Qwen3-VL target selection and 3×3 preferred grasp location
-- GroundingDINO localization with confidence + VLM-centroid soft ranking
-- GraspNet inference
-- target-region grasp filtering
-- continuous angle + preferred-location grasp ranking
-- four-view full-scene fallback grasping
-- continuity-first Panda inverse kinematics
-- JOINT_POSITION / q_ref grasp execution
-- 1 cm Cartesian grasp / lift waypoints
-- persistent force-stop during grasp descent
-- stable-width gripper closing
-- fixed joint-space transport
-- simulator-side reward and task-success evaluation
-- unified open-gripper return-home recovery for recoverable execution failures
-- retry-based closed-loop execution
-- grasp / perception debugging outputs
-- project-local native extension build workflow
-- clean-clone standalone runtime design
-
-The project is under active development as part of a bachelor thesis on VLM-based robotic grasping and simulation migration.
+This repository contains research code. The licensing status of third-party components and assets remains subject to their original licenses.

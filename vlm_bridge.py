@@ -73,16 +73,52 @@ def process_grasping_result(
     lines = output.strip().splitlines()
 
     result = {
+        "target_object": None,
         "selected_object": None,
         "selection_reason": None,
         "cropping_box": None,
         "cropping_box_relative": None,
+        "selected_centroid_coordinates": None,
+        "selected_centroid_coordinates_relative": None,
+        "selected_preferred_grasping_location": None,
         "objects": [],
         "is_part": False,
         "raw_output": output,
     }
 
     for i, line in enumerate(lines):
+        if line.startswith("Target Object:"):
+            result["target_object"] = line.split(":", 1)[1].strip()
+
+        elif line.startswith((
+            "Centroid Coordinates:",
+            "Centroid:",
+        )):
+            centroid_text = line.split(":", 1)[1].strip()[1:-1]
+            relative_centroid = tuple(
+                int(value.strip())
+                for value in centroid_text.split(",")
+            )
+            if len(relative_centroid) != 2:
+                raise ValueError(
+                    "Expected two centroid coordinates, got: "
+                    f"{relative_centroid}"
+                )
+            result["selected_centroid_coordinates_relative"] = relative_centroid
+            result["selected_centroid_coordinates"] = (
+                relative_coordinate_to_pixel(relative_centroid[0], image_width),
+                relative_coordinate_to_pixel(relative_centroid[1], image_height),
+            )
+
+        elif line.startswith((
+            "Preferred Grasping Location:",
+            "Preferred Grasp Location:",
+        )):
+            result["selected_preferred_grasping_location"] = int(
+                line.split(":", 1)[1].strip()
+            )
+
+
         if line.startswith(
             "Selected Object/Object Part:"
         ):
@@ -250,36 +286,27 @@ def get_selected_object_properties(
     selected_object = result.get(
         "selected_object"
     )
+    centroid = result.get("selected_centroid_coordinates")
+    preferred = result.get("selected_preferred_grasping_location")
 
     if not selected_object:
+        raise ValueError("VLM result does not contain a selected object.")
+    if centroid is None:
         raise ValueError(
-            "VLM result does not contain "
-            "a selected object."
+            "VLM result does not contain Centroid Coordinates "
+            "for the selected object."
+        )
+    if preferred is None:
+        raise ValueError(
+            "VLM result does not contain Preferred Grasping Location "
+            "for the selected object."
         )
 
-    selected_key = (
-        selected_object
-        .strip()
-        .casefold()
-        .replace("_", " ")
-    )
-
-    for obj in result.get("objects", []):
-        object_key = (
-            obj["name"]
-            .strip()
-            .casefold()
-            .replace("_", " ")
-        )
-
-        if object_key == selected_key:
-            return obj
-
-    raise ValueError(
-        "Could not match selected object "
-        f"{selected_object!r} to any object "
-        "property block in the VLM response."
-    )
+    return {
+        "name": selected_object,
+        "centroid_coordinates": centroid,
+        "preferred_grasping_location": preferred,
+    }
 
 
 def run_vlm_selection(
@@ -394,3 +421,5 @@ def run_vlm_selection(
         ),
         "raw_output": raw_output,
     }
+
+

@@ -1,0 +1,2 @@
+Please pick up the green speaker.
+green_speaker

@@ -136,6 +136,32 @@ GSO_SCENE_OBJECT_SPECS = {
         {"name": "crocodile_toy", "model_dir": "My_First_Wiggle_Crocodile"},
         {"name": "cleanser_bottle", "model_dir": "Perricone_MD_Nutritive_Cleanser"},
     ],
+    "scene11": [
+        {"name": "white_ramekin", "model_dir": "BIA_Porcelain_Ramekin_With_Glazed_Rim_35_45_oz_cup"},
+        {"name": "ecoforms_cup", "model_dir": "Ecoforms_Cup_B4_SAN"},
+        {"name": "coffee_mug", "model_dir": "ACE_Coffee_Mug_Kristen_16_oz_cup"},
+        {"name": "ink_cartridge", "model_dir": "Canon_Pixma_Ink_Cartridge_8"},
+        {"name": "crayon_box", "model_dir": "Crayola_Bonus_64_Crayons"},
+        {"name": "gaming_mouse", "model_dir": "Razer_Abyssus_Ambidextrous_Gaming_Mouse"},
+        {"name": "mario_figure", "model_dir": "Nintendo_Mario_Action_Figure"},
+        {"name": "green_speaker", "model_dir": "JBL_Charge_Speaker_portable_wireless_wired_Green"},
+        {"name": "peanut_butter_candy_box", "model_dir": "Nestle_Nips_Hard_Candy_Peanut_Butter"},
+    ],
+}
+
+
+GSO_SCENE_FIXED_DROP_XY = {
+    "scene11": {
+        "white_ramekin": [0.145, 0.000],
+        "ecoforms_cup": [0.145, 0.018],
+        "coffee_mug": [0.125, -0.025],
+        "ink_cartridge": [0.165, -0.018],
+        "crayon_box": [0.155, 0.038],
+        "gaming_mouse": [0.115, 0.030],
+        "mario_figure": [0.175, 0.025],
+        "green_speaker": [0.135, -0.045],
+        "peanut_butter_candy_box": [0.170, -0.040],
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -248,8 +274,14 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
         camera_segmentations="instance",
         hard_reset=True,
         scene_name="scene01",
+        restore_scene_state_path=None,
         **kwargs,
     ):
+        self.restore_scene_state_path = (
+            Path(restore_scene_state_path).resolve()
+            if restore_scene_state_path is not None
+            else None
+        )
         self.table_full_size = (0.8, 0.8, 0.05)
         self.table_friction = (1.0, 5e-3, 1e-4)
         self.table_offset = np.array((0.07, 0.0, 0.83))
@@ -891,6 +923,34 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
     def _reset_internal(self):
         super()._reset_internal()
 
+        # Paired evaluations restore a previously generated scene before any
+        # new random clutter is constructed.
+        if self.restore_scene_state_path is not None:
+            state_path = self.restore_scene_state_path
+            if not state_path.is_file():
+                raise FileNotFoundError(
+                    f"Scene state file does not exist: {state_path}"
+                )
+            with np.load(state_path) as state:
+                saved_qpos = np.asarray(state["qpos"], dtype=np.float64)
+                saved_qvel = np.asarray(state["qvel"], dtype=np.float64)
+                if saved_qpos.shape != self.sim.data.qpos.shape:
+                    raise ValueError(
+                        "Saved scene qpos shape does not match the current "
+                        f"environment: {saved_qpos.shape} vs "
+                        f"{self.sim.data.qpos.shape}"
+                    )
+                if saved_qvel.shape != self.sim.data.qvel.shape:
+                    raise ValueError(
+                        "Saved scene qvel shape does not match the current "
+                        f"environment: {saved_qvel.shape} vs "
+                        f"{self.sim.data.qvel.shape}"
+                    )
+                self.sim.data.qpos[:] = saved_qpos
+                self.sim.data.qvel[:] = saved_qvel
+            self.sim.forward()
+            return
+
         # Save the Panda reset posture before any object is dropped.
         # During clutter construction, raw self.sim.step() calls advance
         # physics without running robosuite's OSC controller. The saved
@@ -1447,8 +1507,19 @@ class ThinkGraspMinimalEnv(ManipulationEnv):
             self._park_all_clutter_objects()
             drop_results = []
 
+            fixed_drop_xy = GSO_SCENE_FIXED_DROP_XY.get(
+                self.scene_name,
+                {},
+            )
+
             for obj in self.objects:
-                drop_xy = self._sample_workspace_drop_xy()
+                if obj.name in fixed_drop_xy:
+                    drop_xy = np.array(
+                        fixed_drop_xy[obj.name],
+                        dtype=np.float64,
+                    )
+                else:
+                    drop_xy = self._sample_workspace_drop_xy()
 
                 drop_position = np.array(
                     [

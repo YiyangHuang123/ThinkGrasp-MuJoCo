@@ -19,6 +19,7 @@ fallback grasp is used to perturb the clutter before the next cycle.
 from pathlib import Path
 from datetime import datetime
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -40,6 +41,14 @@ from scene_bridge import (
 )
 from thinkgrasp_minimal_env import (
     GSO_SCENE_OBJECT_SPECS,
+    GRASP_FORCE_STOP_CONSECUTIVE_STEPS,
+    IK_BEST_EFFORT_MAX_ORIENTATION_ERROR_DEG,
+    IK_BEST_EFFORT_MAX_POSITION_ERROR_M,
+    IK_CARTESIAN_WAYPOINT_SPACING,
+    IK_JOINT_DAMPING_RATIO,
+    IK_JOINT_KP,
+    IK_QREF_SPEED_RAD_PER_SEC,
+    PYBULLET_STYLE_GRASP_FORCE_THRESHOLD,
     ThinkGraspMinimalEnv,
     load_thinkgrasp_joint_position_controller_config,
 )
@@ -104,6 +113,15 @@ GRASP_DEBUG_TARGET_REGION_DIR = (
 GRASP_DEBUG_SELECTED_GRASP_DIR = (
     GRASP_DEBUG_PREVIEW_DIR / "selected_grasp"
 )
+GRASP_DEBUG_GEOMETRY_ONLY_DIR = (
+    GRASP_DEBUG_PREVIEW_DIR / "selected_grasp_geometry_only"
+)
+GRASP_DEBUG_VLM_GUIDED_DIR = (
+    GRASP_DEBUG_PREVIEW_DIR / "selected_grasp_vlm_guided"
+)
+GRASP_DEBUG_VLM_ONLY_DIR = (
+    GRASP_DEBUG_PREVIEW_DIR / "selected_grasp_vlm_only"
+)
 
 LOG_OUTPUT_DIR = (
     CLOSED_LOOP_OUTPUT_DIR / "logs"
@@ -167,6 +185,10 @@ FULL_SCENE_CAMERAS = (
 MIN_WORKSPACE_POINTS = 30
 
 MAX_ATTEMPTS = 50
+GRASP_SELECTION_ONLY = False
+EVALUATION_MODE = "full"
+SCENE_STATE_SAVE_PATH = None
+SCENE_STATE_RESTORE_PATH = None
 MIN_GRASPED_GRIPPER_WIDTH = 0.005
 
 # ---------------------------------------------------------------------------
@@ -241,20 +263,21 @@ DEFAULT_CASE_BY_SCENE = {
     "scene08": "case_scene08_creatine_bottle.txt",
     "scene09": "case_scene09_lion_figure.txt",
     "scene10": "case_scene10_crocodile_toy.txt",
+    "scene11": "case_scene11_white_ramekin_clutter.txt",
 }
 
 
 def _normalize_scene_name(scene_argument):
-    """Accept either 1..10 or scene01..scene10 and return sceneXX."""
+    """Accept either 1..15 or scene01..scene15 and return sceneXX."""
 
     value = str(scene_argument).strip().lower()
 
     if value.isdigit():
         scene_number = int(value)
 
-        if not 1 <= scene_number <= 10:
+        if not 1 <= scene_number <= 15:
             raise ValueError(
-                "--scene numeric value must be between 1 and 10, "
+                "--scene numeric value must be between 1 and 15, "
                 f"got {scene_argument!r}."
             )
 
@@ -263,11 +286,289 @@ def _normalize_scene_name(scene_argument):
     if value not in GSO_SCENE_OBJECT_SPECS:
         raise ValueError(
             f"Unknown scene {scene_argument!r}. "
-            "Use 1..10 or one of "
+            "Use 1..15 or one of "
             f"{sorted(GSO_SCENE_OBJECT_SPECS)}."
         )
 
     return value
+
+
+def _json_default(value):
+    """Convert NumPy and path values used in run snapshots to JSON."""
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    raise TypeError(
+        f"Object of type {type(value).__name__} is not JSON serializable"
+    )
+
+
+def _get_git_revision():
+    """Return the current git revision when the runner is inside a repo."""
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ],
+            cwd=SCRIPT_DIR,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def _validate_unit_interval(
+    value,
+    argument_name,
+):
+    value = float(value)
+
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(
+            f"{argument_name} must be between 0 and 1, got {value}."
+        )
+
+    return value
+
+
+def _validate_positive_float(
+    value,
+    argument_name,
+):
+    value = float(value)
+
+    if value <= 0.0:
+        raise ValueError(
+            f"{argument_name} must be positive, got {value}."
+        )
+
+    return value
+
+
+def apply_cli_runtime_overrides(args):
+    """Apply optional experiment parameters without changing default behavior."""
+
+    global DINO_RANKING_CONFIDENCE_WEIGHT
+    global DINO_RANKING_CENTROID_WEIGHT
+    global DINO_RANKING_CENTROID_SIGMA_M
+    global GRASP_SELECTION_ANGLE_WEIGHT
+    global GRASP_SELECTION_PREFERRED_WEIGHT
+    global GRASP_SELECTION_ANGLE_SIGMA_DEG
+    global GRASP_SELECTION_PREFERRED_SIGMA_M
+    global FULL_SCENE_FALLBACK_ANGLE_WEIGHT
+    global FULL_SCENE_FALLBACK_GRASPNET_WEIGHT
+    global MAX_ATTEMPTS
+    global GRASP_SELECTION_ONLY
+    global EVALUATION_MODE
+    global SCENE_STATE_SAVE_PATH
+    global SCENE_STATE_RESTORE_PATH
+
+    GRASP_SELECTION_ONLY = bool(args.grasp_selection_only)
+    EVALUATION_MODE = str(args.evaluation_mode)
+    SCENE_STATE_SAVE_PATH = (
+        Path(args.save_scene_state).resolve()
+        if args.save_scene_state
+        else None
+    )
+    SCENE_STATE_RESTORE_PATH = (
+        Path(args.restore_scene_state).resolve()
+        if args.restore_scene_state
+        else None
+    )
+
+    if EVALUATION_MODE == "baseline":
+        # Baseline: original target text, highest DINO confidence, and
+        # geometry-only grasp ranking. Full mode remains the default.
+        DINO_RANKING_CONFIDENCE_WEIGHT = 1.0
+        DINO_RANKING_CENTROID_WEIGHT = 0.0
+        GRASP_SELECTION_ANGLE_WEIGHT = 1.0
+        GRASP_SELECTION_PREFERRED_WEIGHT = 0.0
+
+    if args.dino_confidence_weight is not None:
+        confidence_weight = _validate_unit_interval(
+            args.dino_confidence_weight,
+            "--dino-confidence-weight",
+        )
+        DINO_RANKING_CONFIDENCE_WEIGHT = confidence_weight
+        DINO_RANKING_CENTROID_WEIGHT = 1.0 - confidence_weight
+
+    if args.dino_centroid_sigma_m is not None:
+        DINO_RANKING_CENTROID_SIGMA_M = _validate_positive_float(
+            args.dino_centroid_sigma_m,
+            "--dino-centroid-sigma-m",
+        )
+
+    if args.grasp_angle_weight is not None:
+        angle_weight = _validate_unit_interval(
+            args.grasp_angle_weight,
+            "--grasp-angle-weight",
+        )
+        GRASP_SELECTION_ANGLE_WEIGHT = angle_weight
+        GRASP_SELECTION_PREFERRED_WEIGHT = 1.0 - angle_weight
+
+    if args.grasp_angle_sigma_deg is not None:
+        GRASP_SELECTION_ANGLE_SIGMA_DEG = _validate_positive_float(
+            args.grasp_angle_sigma_deg,
+            "--grasp-angle-sigma-deg",
+        )
+
+    if args.grasp_preferred_sigma_m is not None:
+        GRASP_SELECTION_PREFERRED_SIGMA_M = _validate_positive_float(
+            args.grasp_preferred_sigma_m,
+            "--grasp-preferred-sigma-m",
+        )
+
+    if args.fallback_angle_weight is not None:
+        angle_weight = _validate_unit_interval(
+            args.fallback_angle_weight,
+            "--fallback-angle-weight",
+        )
+        FULL_SCENE_FALLBACK_ANGLE_WEIGHT = angle_weight
+        FULL_SCENE_FALLBACK_GRASPNET_WEIGHT = 1.0 - angle_weight
+
+    if args.max_attempts is not None:
+        max_attempts = int(args.max_attempts)
+        if max_attempts <= 0:
+            raise ValueError(
+                f"--max-attempts must be positive, got {max_attempts}."
+            )
+        MAX_ATTEMPTS = max_attempts
+
+
+def build_runtime_config_snapshot(
+    case_config,
+    controller_config,
+):
+    """Collect the fixed weights and thresholds used by one experiment run."""
+
+    return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "evaluation_mode": EVALUATION_MODE,
+        "git_revision": _get_git_revision(),
+        "case": {
+            "scene_name": case_config["scene_name"],
+            "case_path": str(case_config["case_path"]),
+            "language_goal": case_config["language_goal"],
+            "simulator_gt_target_object": case_config["target_object"],
+        },
+        "perception": {
+            "grounding_box_threshold": GROUNDING_BOX_THRESHOLD,
+            "grounding_text_threshold": GROUNDING_TEXT_THRESHOLD,
+            "grounding_crop_margin_px": GROUNDING_CROP_MARGIN,
+            "grounding_target_grasp_margin_px": (
+                GROUNDING_TARGET_GRASP_MARGIN
+            ),
+            "perception_width_px": PERCEPTION_WIDTH,
+            "perception_height_px": PERCEPTION_HEIGHT,
+            "min_workspace_points": MIN_WORKSPACE_POINTS,
+        },
+        "target_ranking": {
+            "confidence_weight": DINO_RANKING_CONFIDENCE_WEIGHT,
+            "centroid_weight": DINO_RANKING_CENTROID_WEIGHT,
+            "centroid_sigma_m": DINO_RANKING_CENTROID_SIGMA_M,
+        },
+        "grasp_selection": {
+            "angle_weight": GRASP_SELECTION_ANGLE_WEIGHT,
+            "preferred_weight": GRASP_SELECTION_PREFERRED_WEIGHT,
+            "angle_sigma_deg": GRASP_SELECTION_ANGLE_SIGMA_DEG,
+            "preferred_sigma_m": GRASP_SELECTION_PREFERRED_SIGMA_M,
+            "min_grasped_gripper_width_m": MIN_GRASPED_GRIPPER_WIDTH,
+        },
+        "fallback": {
+            "enabled_when_target_region_has_zero_grasps": True,
+            "angle_weight": FULL_SCENE_FALLBACK_ANGLE_WEIGHT,
+            "graspnet_weight": FULL_SCENE_FALLBACK_GRASPNET_WEIGHT,
+            "table_height_m": FULL_SCENE_TABLE_HEIGHT_M,
+            "table_clearance_m": FULL_SCENE_TABLE_CLEARANCE_M,
+            "max_height_above_table_m": FULL_SCENE_MAX_HEIGHT_ABOVE_TABLE_M,
+            "cameras": [
+                {
+                    "name": name,
+                    "width_px": width,
+                    "height_px": height,
+                }
+                for name, width, height in FULL_SCENE_CAMERAS
+            ],
+        },
+        "execution": {
+            "max_attempts": MAX_ATTEMPTS,
+            "ik_qref_speed_rad_per_sec": IK_QREF_SPEED_RAD_PER_SEC,
+            "ik_joint_kp": IK_JOINT_KP,
+            "ik_joint_damping_ratio": IK_JOINT_DAMPING_RATIO,
+            "ik_cartesian_waypoint_spacing_m": (
+                IK_CARTESIAN_WAYPOINT_SPACING
+            ),
+            "ik_best_effort_max_position_error_m": (
+                IK_BEST_EFFORT_MAX_POSITION_ERROR_M
+            ),
+            "ik_best_effort_max_orientation_error_deg": (
+                IK_BEST_EFFORT_MAX_ORIENTATION_ERROR_DEG
+            ),
+            "force_stop_threshold": PYBULLET_STYLE_GRASP_FORCE_THRESHOLD,
+            "force_stop_consecutive_steps": (
+                GRASP_FORCE_STOP_CONSECUTIVE_STEPS
+            ),
+            "video_physics_capture_interval": (
+                IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
+            ),
+            "panda_drop_joints": PANDA_DROP_JOINTS,
+            "controller_config": controller_config,
+        },
+        "evaluation": {
+            "metric": "step_count_and_task_success",
+            "task_success_rule": (
+                "after release and return-home, simulator GT target body "
+                "must lie inside the receiving-bin XY footprint"
+            ),
+        },
+    }
+
+
+def save_runtime_config_snapshot(
+    case_config,
+    controller_config,
+    log_path,
+):
+    """Persist a machine-readable snapshot next to the human-readable log."""
+
+    snapshot = build_runtime_config_snapshot(
+        case_config=case_config,
+        controller_config=controller_config,
+    )
+
+    config_path = Path(log_path).with_suffix(".config.json")
+    config_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    config_path.write_text(
+        json.dumps(
+            snapshot,
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return config_path
 
 
 def load_case_config():
@@ -288,7 +589,7 @@ def load_case_config():
     parser = argparse.ArgumentParser(
         description=(
             "Run one fixed MuJoCo scene. "
-            "Use --scene 1..10 to automatically load that scene's fixed case. "
+            "Use --scene 1..15 to automatically load that scene's fixed case. "
             "Use --case only when an explicit case override is needed."
         )
     )
@@ -297,7 +598,7 @@ def load_case_config():
         type=str,
         default="1",
         help=(
-            "Scene number 1..10, or scene01..scene10. "
+            "Scene number 1..15, or scene01..scene15. "
             "Default: 1."
         ),
     )
@@ -311,7 +612,111 @@ def load_case_config():
             "If omitted, the fixed case for --scene is loaded automatically."
         ),
     )
+    parser.add_argument(
+        "--dino-confidence-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional sensitivity-analysis override for the GroundingDINO "
+            "confidence weight. The VLM-centroid weight becomes 1 - this "
+            "value. Default keeps the source constant."
+        ),
+    )
+    parser.add_argument(
+        "--dino-centroid-sigma-m",
+        type=float,
+        default=None,
+        help=(
+            "Optional sensitivity-analysis override for the VLM-centroid "
+            "spatial sigma in metres."
+        ),
+    )
+    parser.add_argument(
+        "--grasp-angle-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional sensitivity-analysis override for the normal "
+            "grasp-selection angle weight. The preferred-location weight "
+            "becomes 1 - this value."
+        ),
+    )
+    parser.add_argument(
+        "--grasp-angle-sigma-deg",
+        type=float,
+        default=None,
+        help=(
+            "Optional sensitivity-analysis override for the approach-angle "
+            "score sigma in degrees."
+        ),
+    )
+    parser.add_argument(
+        "--grasp-preferred-sigma-m",
+        type=float,
+        default=None,
+        help=(
+            "Optional sensitivity-analysis override for the preferred-location "
+            "distance sigma in metres."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-angle-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional sensitivity-analysis override for the full-scene "
+            "fallback angle weight. The GraspNet-confidence weight becomes "
+            "1 - this value."
+        ),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for the maximum number of closed-loop "
+            "perception attempts."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-mode",
+        choices=("full", "baseline"),
+        default="full",
+        help=(
+            "Evaluation mode. 'full' keeps the complete VLM-guided pipeline; "
+            "'baseline' uses the original target name, highest DINO confidence, "
+            "and geometry-only grasp selection."
+        ),
+    )
+    parser.add_argument(
+        "--grasp-selection-only",
+        action="store_true",
+        help=(
+            "Run scene perception and grasp generation, export geometry-only "
+            "and VLM-guided grasp PLY files, then stop before robot execution."
+        ),
+    )
+    parser.add_argument(
+        "--save-scene-state",
+        type=str,
+        default=None,
+        help=(
+            "Optional NPZ path for saving the initial MuJoCo scene state "
+            "after scene generation."
+        ),
+    )
+    parser.add_argument(
+        "--restore-scene-state",
+        type=str,
+        default=None,
+        help=(
+            "Optional NPZ path for restoring a previously saved initial "
+            "MuJoCo scene state after environment construction."
+        ),
+    )
     args = parser.parse_args()
+
+    apply_cli_runtime_overrides(args)
 
     scene_name = _normalize_scene_name(
         args.scene
@@ -1580,18 +1985,7 @@ def save_combined_grounding_visualization(
     preferred_pixel_xy,
     output_path,
 ):
-    """Save one per-attempt GroundingDINO overview image.
-
-    The image contains:
-      - every GroundingDINO candidate bbox with only its final weighted score;
-      - the selected bbox highlighted with a thick blue border + SELECTED;
-      - the selected bbox split into the 3x3 preferred grasp grid;
-      - the preferred cell highlighted;
-      - the preferred world-point source pixel marked.
-
-    All bbox coordinates must be in the same image coordinate system as
-    ``image``.
-    """
+    """Save the final selected GroundingDINO bbox and score only."""
 
     image = np.asarray(image)
 
@@ -1618,18 +2012,14 @@ def save_combined_grounding_visualization(
         dtype=np.float64,
     ).reshape(-1, 4)
     selected_index = int(selected_index)
-    preferred_location = int(preferred_location)
-
-    # 1) Draw all candidates first.
     for idx, box in enumerate(boxes):
         x1, y1, x2, y2 = [float(v) for v in box]
-        is_selected = (idx == selected_index)
 
-        if is_selected:
-            outline = (0, 120, 255)  # blue
+        if idx == selected_index:
+            outline = (0, 120, 255)  # selected bbox
             width = 5
         else:
-            outline = (255, 0, 0)    # red
+            outline = (255, 0, 0)    # other candidate bboxes
             width = 2
 
         draw.rectangle(
@@ -1638,13 +2028,9 @@ def save_combined_grounding_visualization(
             width=width,
         )
 
-        # Display only the score that actually controls bbox selection.
-        # final_bbox_score = 0.70 * DINO + 0.30 * centroid proximity.
         label = f"{float(final_bbox_scores[idx]):.3f}"
-
-        # Keep label inside image as much as possible.
         label_x = max(0, int(round(x1)))
-        label_y = max(0, int(round(y1)) - 13)
+        label_y = max(0, int(round(y1)) - 18)
 
         draw.text(
             (label_x, label_y),
@@ -1654,99 +2040,6 @@ def save_combined_grounding_visualization(
             stroke_width=2,
             stroke_fill=(255, 255, 255),
         )
-
-    # 2) Overlay 3x3 grid only on selected bbox.
-    x1, y1, x2, y2 = [
-        float(v)
-        for v in boxes[selected_index]
-    ]
-
-    cell_w = (x2 - x1) / 3.0
-    cell_h = (y2 - y1) / 3.0
-
-    grid_color = (0, 220, 255)
-    for split in (1, 2):
-        gx = x1 + split * cell_w
-        gy = y1 + split * cell_h
-
-        draw.line(
-            [(gx, y1), (gx, y2)],
-            fill=grid_color,
-            width=2,
-        )
-        draw.line(
-            [(x1, gy), (x2, gy)],
-            fill=grid_color,
-            width=2,
-        )
-
-    # Number cells 1..9.
-    for cell in range(1, 10):
-        row = (cell - 1) // 3
-        col = (cell - 1) % 3
-
-        cx1 = x1 + col * cell_w
-        cy1 = y1 + row * cell_h
-        cx2 = x1 + (col + 1) * cell_w
-        cy2 = y1 + (row + 1) * cell_h
-
-        center_x = 0.5 * (cx1 + cx2)
-        center_y = 0.5 * (cy1 + cy2)
-
-        if cell == preferred_location:
-            draw.rectangle(
-                [cx1, cy1, cx2, cy2],
-                outline=(255, 215, 0),
-                width=4,
-            )
-
-        # Small dark badge for the cell number.
-        r = 10
-        draw.ellipse(
-            [
-                center_x - r,
-                center_y - r,
-                center_x + r,
-                center_y + r,
-            ],
-            fill=(55, 55, 55),
-        )
-        try:
-            num_bbox = draw.textbbox(
-                (0, 0),
-                str(cell),
-                font=font,
-            )
-            num_w = num_bbox[2] - num_bbox[0]
-            num_h = num_bbox[3] - num_bbox[1]
-        except Exception:
-            num_w, num_h = 8, 12
-
-        draw.text(
-            (center_x - num_w / 2.0, center_y - num_h / 2.0),
-            str(cell),
-            fill=(255, 255, 255),
-            font=font,
-        )
-
-    # 3) Mark preferred source pixel.
-    preferred_pixel_xy = np.asarray(
-        preferred_pixel_xy,
-        dtype=np.float64,
-    ).reshape(2)
-
-    px, py = [
-        float(v)
-        for v in preferred_pixel_xy
-    ]
-
-    r = 8
-    draw.ellipse(
-        [px - r, py - r, px + r, py + r],
-        fill=(255, 80, 80),
-        outline=(255, 255, 255),
-        width=3,
-    )
 
     output_path = Path(output_path)
     output_path.parent.mkdir(
@@ -2282,7 +2575,7 @@ def _run_with_log():
                 "Closed-loop log:",
                 log_path,
             )
-            main()
+            main(log_path=log_path)
         except Exception:
             traceback.print_exc()
             raise SystemExit(1)
@@ -2414,89 +2707,7 @@ def summarize_ik_phase_diagnostic(phase_result):
 # Closed-Loop Task Execution
 # ============================================================
 
-def settle_attempt_reward(
-    reward,
-    reason,
-    episode_reward,
-    attempt_reward_settled,
-):
-    if attempt_reward_settled:
-        print(
-            "Reward already settled for this attempt; "
-            f"skipping duplicate reward ({reason})."
-        )
-        return episode_reward, attempt_reward_settled
-
-    episode_reward += float(reward)
-    attempt_reward_settled = True
-
-    print(
-        f"Reward: {float(reward):+.4f} "
-        f"({reason}), "
-        f"episode_reward={episode_reward:+.4f}"
-    )
-
-    return episode_reward, attempt_reward_settled
-
-
-def recover_open_gripper_home(
-    env,
-    recorder,
-    home_joint_positions,
-    reason,
-):
-    print()
-    print("#" * 70)
-    print("EXECUTION RECOVERY - OPEN GRIPPER, RETURN HOME")
-    print("#" * 70)
-    print("Recovery reason:", reason)
-    print("Opening gripper at the current configuration.")
-
-    env.open_gripper(steps=30)
-    recorder.capture_frame()
-    recorder.add_hold(0.5)
-
-    recovery_result = env.move_joints_qref(
-        target_joint_positions=home_joint_positions,
-        gripper_command=-1.0,
-        stop_on_table_contact=False,
-        frame_callback=(
-            lambda _env: recorder.capture_frame()
-        ),
-        frame_capture_interval=(
-            IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
-        ),
-    )
-
-    print(
-        "Return-home recovery success:",
-        recovery_result["success"],
-    )
-    print(
-        "Return-home recovery failure reason:",
-        recovery_result["failure_reason"],
-    )
-
-    if recovery_result["success"]:
-        env.open_gripper(steps=30)
-        recorder.capture_frame()
-        recorder.add_hold(0.5)
-
-        print(
-            "Recovery complete. Starting a new perception / "
-            "planning cycle."
-        )
-        return True
-
-    print(
-        "Return-home recovery failed. Terminating current run."
-    )
-    recorder.capture_frame()
-    recorder.add_hold(2.0)
-    return False
-
-
-def main():
+def main(log_path=None):
     case_config = load_case_config()
     vlm_goal = case_config["language_goal"]
     target_object = case_config["target_object"]
@@ -2515,11 +2726,43 @@ def main():
 
     print("Grasp control mode: IK + q_ref + JOINT_POSITION")
 
+    runtime_config_path = save_runtime_config_snapshot(
+        case_config=case_config,
+        controller_config=controller_config,
+        log_path=(
+            log_path
+            if log_path is not None
+            else LOG_OUTPUT_DIR
+            / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.config.json"
+        ),
+    )
+
+    print(
+        "Runtime config snapshot:",
+        runtime_config_path,
+    )
+
     env = ThinkGraspMinimalEnv(
         controller_configs=controller_config,
         hard_reset=False,
         scene_name=scene_name,
+        restore_scene_state_path=SCENE_STATE_RESTORE_PATH,
     )
+
+    if SCENE_STATE_RESTORE_PATH is not None:
+        state_path = SCENE_STATE_RESTORE_PATH
+        print("Restored initial scene state:", state_path)
+
+    if SCENE_STATE_SAVE_PATH is not None:
+        state_path = SCENE_STATE_SAVE_PATH
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            state_path,
+            qpos=np.asarray(env.sim.data.qpos, dtype=np.float64).copy(),
+            qvel=np.asarray(env.sim.data.qvel, dtype=np.float64).copy(),
+            time=np.asarray([float(env.sim.data.time)], dtype=np.float64),
+        )
+        print("Saved initial scene state:", state_path)
 
     print(
         "Scene objects:",
@@ -2585,8 +2828,6 @@ def main():
         attempts_started = 0
         ended_no_grasp_after_fallback = False
 
-        episode_reward = 0.0
-
         max_pos_dist = float(
             np.sqrt(
                 (
@@ -2608,7 +2849,6 @@ def main():
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             attempts_started = attempt
-            attempt_reward_settled = False
 
             print()
             print("=" * 60)
@@ -2690,6 +2930,10 @@ def main():
             )[ry1:ry2, rx1:rx2].copy()
 
             imageio.imwrite(
+                GROUNDING_IMAGE_PATH,
+                raw_workspace_rgb,
+            )
+            imageio.imwrite(
                 PERCEPTION_VIEW_OUTPUT_DIR / "raw_workspace_rgb.png",
                 raw_workspace_rgb,
             )
@@ -2707,36 +2951,41 @@ def main():
             #   external natural-language goal + same top-view RGB
             #   -> selected object + preferred 3x3 grasp location
 
-            print()
-            print("Running Qwen3-VL selection.")
-
-            vlm_result = run_vlm_selection(
-                image_path=FULL_PERCEPTION_IMAGE_PATH,
-                goal=vlm_goal,
-                system_prompt_path=VLM_SYSTEM_PROMPT_PATH,
-            )
-
-            vlm_selected_object = str(
-                vlm_result["selected_object"]
-            ).strip()
-
-            vlm_selection_reason = (
-                vlm_result.get("selection_reason")
-                or "not provided"
-            )
-
-            preferred_grasping_location = int(
-                vlm_result[
-                    "preferred_grasping_location"
-                ]
-            )
-
-            vlm_selected_centroid_xy = np.asarray(
-                vlm_result["selected_properties"][
-                    "centroid_coordinates"
-                ],
-                dtype=np.float64,
-            ).reshape(2)
+            if EVALUATION_MODE == "baseline":
+                print("Evaluation mode: baseline (VLM selection bypassed).")
+                vlm_result = None
+                vlm_selected_object = str(target_object).strip()
+                vlm_selection_reason = "baseline: original target description"
+                preferred_grasping_location = 5
+                vlm_selected_centroid_xy = np.asarray(
+                    [raw_workspace_rgb.shape[1] / 2.0,
+                     raw_workspace_rgb.shape[0] / 2.0],
+                    dtype=np.float64,
+                )
+            else:
+                print()
+                print("Running Qwen3-VL selection.")
+                vlm_result = run_vlm_selection(
+                    image_path=GROUNDING_IMAGE_PATH,
+                    goal=vlm_goal,
+                    system_prompt_path=VLM_SYSTEM_PROMPT_PATH,
+                )
+                vlm_selected_object = str(
+                    vlm_result["selected_object"]
+                ).strip()
+                vlm_selection_reason = (
+                    vlm_result.get("selection_reason")
+                    or "not provided"
+                )
+                preferred_grasping_location = int(
+                    vlm_result["preferred_grasping_location"]
+                )
+                vlm_selected_centroid_xy = np.asarray(
+                    vlm_result["selected_properties"][
+                        "centroid_coordinates"
+                    ],
+                    dtype=np.float64,
+                ).reshape(2)
 
             print(
                 "VLM:",
@@ -2762,25 +3011,26 @@ def main():
                 f"mapping={vlm_centroid_world_result['fallback_mode']}",
             )
 
-            VLM_SELECTION_OUTPUT_DIR.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-            vlm_viz_path = (
-                VLM_SELECTION_OUTPUT_DIR
-                / (
-                    f"{target_object}_attempt_{attempt}_"
-                    "vlm.png"
+            if vlm_result is not None:
+                VLM_SELECTION_OUTPUT_DIR.mkdir(
+                    parents=True,
+                    exist_ok=True,
                 )
-            )
-            save_vlm_selection_visualization(
-                image=topview_data["color"],
-                bbox_xyxy=vlm_result["result"]["cropping_box"],
-                selected_object=vlm_selected_object,
-                preferred_location=preferred_grasping_location,
-                centroid_xy=vlm_selected_centroid_xy,
-                output_path=vlm_viz_path,
-            )
+                vlm_viz_path = (
+                    VLM_SELECTION_OUTPUT_DIR
+                    / (
+                        f"{target_object}_attempt_{attempt}_"
+                        "vlm.png"
+                    )
+                )
+                save_vlm_selection_visualization(
+                    image=imageio.imread(GROUNDING_IMAGE_PATH),
+                    bbox_xyxy=vlm_result["result"]["cropping_box"],
+                    selected_object=vlm_selected_object,
+                    preferred_location=preferred_grasping_location,
+                    centroid_xy=vlm_selected_centroid_xy,
+                    output_path=vlm_viz_path,
+                )
 
             # ------------------------------------------------------------
             # 3. GroundingDINO Target Localization
@@ -3486,6 +3736,142 @@ def main():
                 f"final={selection['selected_final_score']:.4f}",
             )
 
+            if GRASP_SELECTION_ONLY:
+                geometry_index = int(np.argmax(all_candidate_angle_scores))
+                vlm_only_index = int(np.argmax(all_candidate_preferred_scores))
+                geometry_grasp = candidate_grasps[geometry_index]
+                vlm_only_grasp = candidate_grasps[vlm_only_index]
+                guided_grasp = candidate_grasps[selected_grasp_index]
+
+                save_grasp_set_debug_ply(
+                    env=env,
+                    grasps=np.asarray(geometry_grasp).reshape(1, 7),
+                    scene_points=full_scene_debug_points,
+                    scene_colors=full_scene_debug_colors,
+                    output_dir=GRASP_DEBUG_GEOMETRY_ONLY_DIR,
+                    output_name=(
+                        f"{target_object}_attempt_{attempt}_"
+                        "selected_grasp_geometry_only.ply"
+                    ),
+                )
+                save_grasp_set_debug_ply(
+                    env=env,
+                    grasps=np.asarray(vlm_only_grasp).reshape(1, 7),
+                    scene_points=full_scene_debug_points,
+                    scene_colors=full_scene_debug_colors,
+                    output_dir=GRASP_DEBUG_VLM_ONLY_DIR,
+                    output_name=(
+                        f"{target_object}_attempt_{attempt}_"
+                        "selected_grasp_vlm_only.ply"
+                    ),
+                )
+                save_grasp_set_debug_ply(
+                    env=env,
+                    grasps=np.asarray(guided_grasp).reshape(1, 7),
+                    scene_points=full_scene_debug_points,
+                    scene_colors=full_scene_debug_colors,
+                    output_dir=GRASP_DEBUG_VLM_GUIDED_DIR,
+                    output_name=(
+                        f"{target_object}_attempt_{attempt}_"
+                        "selected_grasp_vlm_guided.ply"
+                    ),
+                )
+                geometry_angle_score = float(
+                    all_candidate_angle_scores[geometry_index]
+                )
+                geometry_grasp = np.asarray(
+                    geometry_grasp,
+                    dtype=np.float64,
+                ).reshape(7)
+                guided_grasp = np.asarray(
+                    guided_grasp,
+                    dtype=np.float64,
+                ).reshape(7)
+                grasp_selection_summary_path = (
+                    GRASP_DEBUG_PREVIEW_DIR
+                    / "grasp_selection_result.json"
+                )
+                grasp_selection_summary_path.write_text(
+                    json.dumps(
+                        {
+                            "scene": scene_name,
+                            "target_object": target_object,
+                            "preferred_world_point": np.asarray(
+                                preferred_world_point,
+                                dtype=np.float64,
+                            ).tolist(),
+                            "candidate_count": int(len(candidate_grasps)),
+                            "geometry_only": {
+                                "candidate_index": geometry_index,
+                                "grasp_pose_xyzw": geometry_grasp.tolist(),
+                                "center_xyz": geometry_grasp[:3].tolist(),
+                                "approach_angle_deg": float(
+                                    candidate_angles[geometry_index]
+                                ),
+                                "angle_score": geometry_angle_score,
+                                "graspnet_score": float(
+                                    candidate_scores[geometry_index]
+                                ),
+                            },
+                            "vlm_guided": {
+                                "candidate_index": selected_grasp_index,
+                                "grasp_pose_xyzw": guided_grasp.tolist(),
+                                "center_xyz": guided_grasp[:3].tolist(),
+                                "approach_angle_deg": float(
+                                    candidate_angles[selected_grasp_index]
+                                ),
+                                "angle_score": float(
+                                    all_candidate_angle_scores[
+                                        selected_grasp_index
+                                    ]
+                                ),
+                                "preferred_score": float(
+                                    all_candidate_preferred_scores[
+                                        selected_grasp_index
+                                    ]
+                                ),
+                                "final_score": float(
+                                    all_candidate_final_scores[
+                                        selected_grasp_index
+                                    ]
+                                ),
+                                "graspnet_score": float(
+                                    candidate_scores[selected_grasp_index]
+                                ),
+                            },
+                            "vlm_only": {
+                                "candidate_index": vlm_only_index,
+                                "grasp_pose_xyzw": np.asarray(
+                                    vlm_only_grasp,
+                                    dtype=np.float64,
+                                ).reshape(7).tolist(),
+                                "center_xyz": np.asarray(
+                                    vlm_only_grasp,
+                                    dtype=np.float64,
+                                ).reshape(7)[:3].tolist(),
+                                "approach_angle_deg": float(
+                                    candidate_angles[vlm_only_index]
+                                ),
+                                "preferred_score": float(
+                                    all_candidate_preferred_scores[
+                                        vlm_only_index
+                                    ]
+                                ),
+                                "graspnet_score": float(
+                                    candidate_scores[vlm_only_index]
+                                ),
+                            },
+                            "same_candidate": bool(
+                                geometry_index == selected_grasp_index
+                            ),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print("Grasp-selection-only mode: PLY files exported.")
+                break
+
             selected_grasp_angle_deg = float(
                 selection["selected_angle_deg"]
             )
@@ -3558,27 +3944,19 @@ def main():
             )
 
             # ---------------------------------------------------------
-            # EXECUTION FAILURE RECOVERY
+            # IK FAILURE RECOVERY (JOINT_POSITION ONLY)
             #
-            # Any recoverable execution-layer failure uses the same policy:
-            # settle this attempt once, open the gripper at the current
-            # configuration, return home with an open gripper, then either
-            # re-perceive or terminate if home recovery itself fails.
+            # If the selected grasp is not IK-converged / executable,
+            # reject this perception cycle, return to the saved home joint
+            # configuration using q_ref + JOINT_POSITION, then re-perceive.
             # ---------------------------------------------------------
             if not bool(execution.get("success", False)):
                 failed_phase = execution.get("failed_phase")
 
-                episode_reward, attempt_reward_settled = (
-                    settle_attempt_reward(
-                        -1.0,
-                        f"no task evaluator: execution failed in {failed_phase}",
-                        episode_reward,
-                        attempt_reward_settled,
-                    )
-                )
-
                 print()
-                print("Execution failed before task evaluation.")
+                print("#" * 70)
+                print("IK EXECUTION FAILED — RECOVERING HOME")
+                print("#" * 70)
                 print("Failed phase:", failed_phase)
 
                 # Diagnostic only: expose why the selected pregrasp IK was
@@ -3656,13 +4034,55 @@ def main():
                                 ),
                             )
 
-                if recover_open_gripper_home(
-                    env,
-                    recorder,
-                    home_joint_positions,
-                    f"execution failed in {failed_phase}",
-                ):
+                # Recovery policy:
+                #   - if lift IK fails after the gripper has closed, release
+                #     the object immediately at the current pose, then return
+                #     home with an open gripper;
+                #   - failures before lift return home with the gripper open.
+                if failed_phase == "lift":
+                    print(
+                        "Lift failed after gripper close. "
+                        "Releasing object at current pose before return-home."
+                    )
+                    env.open_gripper(steps=30)
+                    recorder.capture_frame()
+                    recorder.add_hold(0.5)
+
+                recovery_result = env.move_joints_qref(
+                    target_joint_positions=home_joint_positions,
+                    gripper_command=-1.0,
+                    stop_on_table_contact=False,
+                    frame_callback=(
+                        lambda _env: recorder.capture_frame()
+                    ),
+                    frame_capture_interval=IK_VIDEO_PHYSICS_CAPTURE_INTERVAL,
+                )
+
+                print(
+                    "IK/q_ref return-home success:",
+                    recovery_result["success"],
+                )
+                print(
+                    "IK/q_ref return-home failure reason:",
+                    recovery_result["failure_reason"],
+                )
+
+                if recovery_result["success"]:
+                    env.open_gripper(steps=30)
+                    recorder.capture_frame()
+                    recorder.add_hold(0.5)
+
+                    print(
+                        "Recovery complete. Starting a new perception / "
+                        "planning cycle."
+                    )
                     continue
+
+                print(
+                    "Return-home recovery failed. Stopping this run."
+                )
+                recorder.capture_frame()
+                recorder.add_hold(2.0)
                 break
 
             # =========================================================
@@ -3734,6 +4154,7 @@ def main():
                         )
 
             # Physical grasp failed: no object is retained by the gripper.
+            # Recovery uses JOINT_POSITION only.
             if not gripper_holds_something:
                 print()
                 print(
@@ -3741,62 +4162,52 @@ def main():
                     "that no object is being held."
                 )
 
-                episode_reward, attempt_reward_settled = (
-                    settle_attempt_reward(
-                        -1.0,
-                        "no task evaluator: empty grasp",
-                        episode_reward,
-                        attempt_reward_settled,
-                    )
+                recovery_result = env.move_joints_qref(
+                    target_joint_positions=home_joint_positions,
+                    gripper_command=-1.0,
+                    stop_on_table_contact=False,
+                    frame_callback=(
+                        lambda _env: recorder.capture_frame()
+                    ),
+                    frame_capture_interval=(
+                        IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
+                    ),
                 )
 
-                if recover_open_gripper_home(
-                    env,
-                    recorder,
-                    home_joint_positions,
-                    "empty grasp",
-                ):
-                    continue
-                break
+                print(
+                    "JOINT_POSITION return home after empty grasp success:",
+                    recovery_result["success"],
+                )
 
-            # PyBullet-style grasped-object identification after lift.
-            grasped_obj_id = None
-            grasped_obj_name = None
-            max_height = -np.inf
+                if not recovery_result["success"]:
+                    print(
+                        "Return-home recovery failed. Stopping this run."
+                    )
+                    break
 
+                env.open_gripper(steps=30)
+                recorder.capture_frame()
+                recorder.add_hold(0.5)
+
+                print(
+                    "Home reached. Re-perceiving the current scene."
+                )
+                continue
+
+            # Record which objects are already in the bin before this transport.
+            objects_in_bin_before = set()
             for object_name, body_id in env.object_body_ids.items():
                 object_position = np.asarray(
                     env.sim.data.body_xpos[int(body_id)],
                     dtype=np.float64,
                 )
-
-                if float(object_position[2]) >= max_height:
-                    max_height = float(object_position[2])
-                    grasped_obj_id = int(body_id)
-                    grasped_obj_name = object_name
-
-            grasped_object_position = np.asarray(
-                env.sim.data.body_xpos[grasped_obj_id],
-                dtype=np.float64,
-            )
-
-            target_position_after_lift = np.asarray(
-                env.sim.data.body_xpos[target_body_id],
-                dtype=np.float64,
-            )
-
-            pos_dist = float(
-                np.linalg.norm(
-                    grasped_object_position
-                    - target_position_after_lift
-                )
-            )
-
-            print(
-                "Grasped object:",
-                f"{grasped_obj_name}, "
-                f"target_distance={pos_dist:.4f} m",
-            )
+                if (
+                    abs(float(object_position[0]) - float(env.bin_center[0]))
+                    <= float(env.bin_inner_half_size[0])
+                    and abs(float(object_position[1]) - float(env.bin_center[1]))
+                    <= float(env.bin_inner_half_size[1])
+                ):
+                    objects_in_bin_before.add(object_name)
 
             # ------------------------------------------------------------
             # 6. Transport and Task Evaluation
@@ -3829,22 +4240,6 @@ def main():
                     "Fixed drop-joint transport failed."
                 )
 
-                episode_reward, attempt_reward_settled = (
-                    settle_attempt_reward(
-                        -1.0,
-                        "no task evaluator: fixed transport failed",
-                        episode_reward,
-                        attempt_reward_settled,
-                    )
-                )
-
-                if recover_open_gripper_home(
-                    env,
-                    recorder,
-                    home_joint_positions,
-                    "fixed transport failed",
-                ):
-                    continue
                 break
 
             # ---------------------------------------------------------
@@ -3868,23 +4263,57 @@ def main():
                     "without issuing an intentional bin-release command."
                 )
 
-                episode_reward, attempt_reward_settled = (
-                    settle_attempt_reward(
-                        -1.0,
-                        "no task evaluator: object lost during transport",
-                        episode_reward,
-                        attempt_reward_settled,
-                    )
+                return_home_result = env.move_joints_qref(
+                    target_joint_positions=home_joint_positions,
+                    gripper_command=-1.0,
+                    stop_on_table_contact=False,
+                    frame_callback=(
+                        lambda _env: recorder.capture_frame()
+                    ),
+                    frame_capture_interval=(
+                        IK_VIDEO_PHYSICS_CAPTURE_INTERVAL
+                    ),
                 )
 
-                if recover_open_gripper_home(
-                    env,
-                    recorder,
-                    home_joint_positions,
-                    "object lost during transport",
+                print(
+                    "JOINT_POSITION return home after transport loss:",
+                    return_home_result["success"],
+                )
+
+                if not return_home_result["success"]:
+                    break
+
+                env.open_gripper(steps=30)
+                recorder.capture_frame()
+                recorder.add_hold(0.5)
+
+                print(
+                    "Home reached after transport loss. Re-perceiving."
+                )
+                continue
+
+            objects_in_bin_after = set()
+            for object_name, body_id in env.object_body_ids.items():
+                object_position = np.asarray(
+                    env.sim.data.body_xpos[int(body_id)],
+                    dtype=np.float64,
+                )
+                if (
+                    abs(float(object_position[0]) - float(env.bin_center[0]))
+                    <= float(env.bin_inner_half_size[0])
+                    and abs(float(object_position[1]) - float(env.bin_center[1]))
+                    <= float(env.bin_inner_half_size[1])
                 ):
-                    continue
-                break
+                    objects_in_bin_after.add(object_name)
+
+            newly_in_bin = sorted(
+                objects_in_bin_after - objects_in_bin_before
+            )
+            print("Newly placed objects in bin:", newly_in_bin)
+            if len(newly_in_bin) == 1:
+                print("Grasped object:", newly_in_bin[0])
+            elif len(newly_in_bin) > 1:
+                print("Grasped objects:", newly_in_bin)
 
             # Physical transport succeeded. Release the held object in the bin.
             open_result = env.open_gripper(steps=40)
@@ -3916,16 +4345,7 @@ def main():
 
             if not return_home_result["success"]:
                 print(
-                    "Return home after release failed before task evaluation."
-                )
-
-                episode_reward, attempt_reward_settled = (
-                    settle_attempt_reward(
-                        -1.0,
-                        "no task evaluator: return home after release failed",
-                        episode_reward,
-                        attempt_reward_settled,
-                    )
+                    "Return home after release failed; stopping this run."
                 )
                 break
 
@@ -3959,30 +4379,12 @@ def main():
             )
 
             if target_inside_bin:
-                episode_reward, attempt_reward_settled = (
-                    settle_attempt_reward(
-                        2.0,
-                        "correct target inside bin",
-                        episode_reward,
-                        attempt_reward_settled,
-                    )
-                )
-
                 target_completed = True
                 print(
                     f"Target {target_object} is inside the bin. "
                     "Closed-loop task completed."
                 )
                 break
-
-            episode_reward, attempt_reward_settled = (
-                settle_attempt_reward(
-                    -pos_dist / max_pos_dist,
-                    f"task evaluator reached: wrong object {grasped_obj_name}",
-                    episode_reward,
-                    attempt_reward_settled,
-                )
-            )
 
             print(
                 f"Target {target_object} is not inside the bin. "
@@ -3993,9 +4395,8 @@ def main():
             continue
 
         print()
-        print(
-            f"Final episode reward: {episode_reward:+.4f}"
-        )
+        print(f"Step count: {attempts_started}")
+        print(f"Task success: {target_completed}")
 
         if not target_completed:
             print()
@@ -4049,3 +4450,5 @@ def main():
 
 if __name__ == "__main__":
     _run_with_log()
+
+
