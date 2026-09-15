@@ -1,8 +1,10 @@
-# ThinkGrasp-MuJoCo
+# VLM-Guided Target Grasping in Cluttered MuJoCo Scenes
 
-A MuJoCo-based experimental platform for language-guided target grasping in cluttered scenes.
+A MuJoCo-based research platform for evaluating vision-language-guided target localization, grasp selection, and closed-loop manipulation in cluttered scenes.
 
-The project investigates how a vision-language model (VLM) can assist target localization, grasp selection, and closed-loop manipulation.
+The system combines a vision-language model with GroundingDINO for target localization and GraspNet for 6-DoF grasp generation. It evaluates how VLM-derived visual descriptions, centroids, and preferred grasp regions can assist robotic manipulation in cluttered environments.
+
+This project implements an independent pipeline based on GroundingDINO, GraspNet, and MuJoCo. It is related to prior research on vision-language-guided robotic manipulation, but is not an official implementation or reproduction of any single previous system.
 
 ## Main Features
 
@@ -325,6 +327,10 @@ This project uses third-party components including:
 - external model checkpoints.
 
 Please check the licenses of all third-party software, models, datasets, and scanned objects before redistribution.
+
+## Acknowledgements
+
+We thank the researchers whose work on vision-language-guided robotic manipulation and clutter-aware grasping inspired this project. In particular, ThinkGrasp and related studies provided useful insights into applying vision-language reasoning to object selection and grasp planning in cluttered scenes. This repository implements an independent pipeline based on GroundingDINO, GraspNet, and MuJoCo.
 
 ## License
 
